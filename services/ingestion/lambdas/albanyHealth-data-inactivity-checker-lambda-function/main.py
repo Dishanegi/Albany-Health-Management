@@ -16,16 +16,16 @@ logger.setLevel(logging.INFO)
 
 # Expected file counts per patient
 EXPECTED_FILE_COUNTS = {
-    'garmin-device-stress': 8,
-    'garmin-device-step': 8,
-    'garmin-device-respiration': 8,
-    'garmin-device-pulse-ox': 8,
-    'garmin-device-heart-rate': 8,
+    'garmin-device-stress': 7,
+    'garmin-device-step': 7,
+    'garmin-device-respiration': 7,
+    'garmin-device-pulse-ox': 7,
+    'garmin-device-heart-rate': 7,
     'garmin-connect-sleep-stage': 1
 }
 
 # Completion strategy configuration
-COMPLETION_THRESHOLD_PERCENTAGE = 85
+COMPLETION_THRESHOLD_PERCENTAGE = 80
 TOTAL_EXPECTED_FILES_PER_PATIENT = sum(EXPECTED_FILE_COUNTS.values())
 
 # Retry configuration for race condition handling
