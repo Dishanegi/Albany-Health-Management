@@ -47,9 +47,16 @@ class EventBridgeRules(Construct):
         )
 
         # Create EventBridge rules to trigger Glue workflows
+        # These exact names will be used in AWS EventBridge console
+        completion_rule_name = "trigger-merge-patient-health-metrics"
+        processing_rule_name = "trigger-patients-bbi-flow"
+        
+        # Create EventBridge rule for BBI workflow processing
+        # The 'name' parameter ensures this exact name is used in AWS
         self.garmin_bbi_workflow_rule = events.CfnRule(
             self,
             "GarminBBIWorkflowRule",
+            name=processing_rule_name,  # This sets the exact rule name in AWS
             description="Trigger AlbanyHealthGarminBBIWorkflow",
             event_pattern={
                 "source": ["lambda"],
@@ -64,9 +71,12 @@ class EventBridgeRules(Construct):
             ],
         )
 
+        # Create EventBridge rule for Garmin Health Metrics workflow completion
+        # The 'name' parameter ensures this exact name is used in AWS
         self.garmin_health_metrics_workflow_rule = events.CfnRule(
             self,
             "GarminHealthMetricsWorkflowRule",
+            name=completion_rule_name,  # This sets the exact rule name in AWS
             description="Trigger AlbanyHealthGarminHealthMetricsWorkflow",
             event_pattern={
                 "source": ["lambda"],
@@ -80,3 +90,8 @@ class EventBridgeRules(Construct):
                 )
             ],
         )
+        
+        # Store rule names for Lambda environment variables
+        # These are the exact names that will appear in AWS EventBridge console
+        self.completion_rule_name = completion_rule_name
+        self.processing_rule_name = processing_rule_name

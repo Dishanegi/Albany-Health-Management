@@ -1,4 +1,5 @@
 import json
+import os
 import boto3
 import logging
 from datetime import datetime
@@ -32,18 +33,16 @@ MAX_RETRY_ATTEMPTS = 5
 BASE_RETRY_DELAY = 0.1  # 100ms base delay
 MAX_RETRY_DELAY = 2.0   # 2 second max delay
 
-# EventBridge configuration
-EVENTBRIDGE_BUS_NAME = 'default'
-EVENTBRIDGE_RULES = {
-    'completion_rule': {
-        'name': 'trigger-merge-patient-health-metrics',
-        'description': 'Triggers notifications when batch completes'
-    },
-    'processing_rule': {
-        'name': 'trigger-patients-bbi-flow',
-        'description': 'Triggers data processing pipelines'
+# EventBridge configuration - loaded from environment variables
+def get_eventbridge_config():
+    """
+    Get EventBridge configuration from environment variables
+    """
+    return {
+        'bus_name': os.environ.get('EVENTBRIDGE_BUS_NAME', 'default'),
+        'completion_rule_name': os.environ.get('EVENTBRIDGE_COMPLETION_RULE_NAME', 'trigger-merge-patient-health-metrics'),
+        'processing_rule_name': os.environ.get('EVENTBRIDGE_PROCESSING_RULE_NAME', 'trigger-patients-bbi-flow'),
     }
-}
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """
@@ -671,6 +670,12 @@ def trigger_batch_complete_events(eventbridge_client, bucket_name: str, batch_in
     Trigger EventBridge rules when a batch becomes complete
     """
     try:
+        # Get EventBridge configuration from environment variables
+        eventbridge_config = get_eventbridge_config()
+        completion_rule_name = eventbridge_config['completion_rule_name']
+        processing_rule_name = eventbridge_config['processing_rule_name']
+        eventbus_name = eventbridge_config['bus_name']
+        
         batch_folder = batch_info['batch_folder']
         completion_timestamp = datetime.utcnow().isoformat()
         
@@ -690,10 +695,10 @@ def trigger_batch_complete_events(eventbridge_client, bucket_name: str, batch_in
                     'triggerFile': f"{batch_info['patient_id']}/{batch_info['file_type']}/{batch_info['filename']}",
                     'eventFingerprint': batch_info.get('event_fingerprint'),
                     'completionReason': 'all_required_files_received',
-                    'targetRule': EVENTBRIDGE_RULES['completion_rule']['name']
+                    'targetRule': completion_rule_name
                 }
             }),
-            'EventBusName': EVENTBRIDGE_BUS_NAME
+            'EventBusName': eventbus_name
         }
         
         # Event 2: Batch Ready for Processing
@@ -721,10 +726,10 @@ def trigger_batch_complete_events(eventbridge_client, bucket_name: str, batch_in
                     'batchJsonLocation': f"s3://{bucket_name}/{batch_folder}/batch.json",
                     'lastFileProcessed': f"{batch_info['patient_id']}/{batch_info['file_type']}/{batch_info['filename']}",
                     'processingTrigger': 'file_completion_threshold_met',
-                    'targetRule': EVENTBRIDGE_RULES['processing_rule']['name']
+                    'targetRule': processing_rule_name
                 }
             }),
-            'EventBusName': EVENTBRIDGE_BUS_NAME
+            'EventBusName': eventbus_name
         }
         
         # Send both events to EventBridge
@@ -740,16 +745,16 @@ def trigger_batch_complete_events(eventbridge_client, bucket_name: str, batch_in
             logger.error(f"Failed entries: {response.get('Entries', [])}")
         else:
             logger.info(f"Successfully sent 2 different events to EventBridge for batch {batch_folder}")
-            logger.info(f"Event 1: Targeting rule '{EVENTBRIDGE_RULES['completion_rule']['name']}'")
-            logger.info(f"Event 2: Targeting rule '{EVENTBRIDGE_RULES['processing_rule']['name']}'")
+            logger.info(f"Event 1: Targeting rule '{completion_rule_name}'")
+            logger.info(f"Event 2: Targeting rule '{processing_rule_name}'")
         
         return {
             'events_sent': len(events_to_send),
             'failed_events': failed_events,
             'eventbridge_response': response,
             'targeted_rules': [
-                EVENTBRIDGE_RULES['completion_rule']['name'],
-                EVENTBRIDGE_RULES['processing_rule']['name']
+                completion_rule_name,
+                processing_rule_name
             ],
             'event_details': [
                 {
@@ -758,7 +763,7 @@ def trigger_batch_complete_events(eventbridge_client, bucket_name: str, batch_in
                     'detail_type': 'Batch Processing Complete',
                     'batch_id': batch_folder,
                     'purpose': 'Completion notification',
-                    'target_rule': EVENTBRIDGE_RULES['completion_rule']['name']
+                    'target_rule': completion_rule_name
                 },
                 {
                     'event_number': 2,
@@ -766,7 +771,7 @@ def trigger_batch_complete_events(eventbridge_client, bucket_name: str, batch_in
                     'detail_type': 'Batch Ready for Processing',
                     'batch_id': batch_folder,
                     'purpose': 'Processing trigger',
-                    'target_rule': EVENTBRIDGE_RULES['processing_rule']['name']
+                    'target_rule': processing_rule_name
                 }
             ]
         }

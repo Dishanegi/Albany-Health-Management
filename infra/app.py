@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 import os
+import warnings
+
+# Suppress typeguard warnings from AWS CDK (these are harmless)
+warnings.filterwarnings("ignore", category=UserWarning, module="aws_cdk")
 
 import aws_cdk as cdk
 

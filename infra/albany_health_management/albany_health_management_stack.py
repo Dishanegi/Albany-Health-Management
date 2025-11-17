@@ -55,6 +55,19 @@ class AlbanyHealthManagementStack(Stack):
             "EventBridgeRules",
             lambda_functions.data_inactivity_checker_function,
             glue_workflows,
+        )        
+        # Add EventBridge rule names as environment variables to the data inactivity checker Lambda
+        lambda_functions.data_inactivity_checker_function.add_environment(
+            "EVENTBRIDGE_COMPLETION_RULE_NAME", 
+            event_bridge_rules.completion_rule_name
+        )
+        lambda_functions.data_inactivity_checker_function.add_environment(
+            "EVENTBRIDGE_PROCESSING_RULE_NAME", 
+            event_bridge_rules.processing_rule_name
+        )
+        lambda_functions.data_inactivity_checker_function.add_environment(
+            "EVENTBRIDGE_BUS_NAME", 
+            "default"
         )
 
         # Create an IAM role for S3 to send messages to SQS

@@ -2,7 +2,8 @@ from aws_cdk import (
     
     aws_lambda as lambda_,
     RemovalPolicy,
-    aws_iam as iam
+    aws_iam as iam,
+    Duration
 
 )
 from constructs import Construct
@@ -37,8 +38,16 @@ class LambdaFunctions(Construct):
             "AlbanyHealthMainRouterLambdaFunctionDev",
             function_name="albanyHealth-main-router-lambda-function-dev",
             runtime=lambda_.Runtime.PYTHON_3_13,
-            handler="main.handler",
+            handler="main.lambda_handler",
             code=lambda_.Code.from_asset(f"{services_base_path}/albanyHealth-main-router-lambda-function"),
+            timeout=Duration.seconds(300),  # 5 minutes
+            memory_size=256,  # 256 MB - lightweight routing function
+            environment={
+                "HEALTH_HEART_RATE_QUEUE_DEV": heart_rate_queue.queue_url,
+                "HEALTH_SLEEP_QUEUE_DEV": sleep_queue.queue_url,
+                "HEALTH_STEP_QUEUE_DEV": step_queue.queue_url,
+                "HEALTH_OTHERS_QUEUE_DEV": others_queue.queue_url,
+            }
         )
 
         self.heart_rate_function = lambda_.Function(
@@ -46,13 +55,18 @@ class LambdaFunctions(Construct):
             "AlbanyHealthHeartRateLambdaFunctionDev",
             function_name="albanyHealth-heart-rate-lambda-function-dev",
             runtime=lambda_.Runtime.PYTHON_3_13,
-            handler="main.handler",
+            handler="main.lambda_handler",
             code=lambda_.Code.from_asset(f"{services_base_path}/albanyHealth-heart-rate-lambda-function"),
+            timeout=Duration.seconds(300),  # 5 minutes
+            memory_size=1024,  # 1024 MB - more memory for faster pandas processing
             layers=[lambda_.LayerVersion.from_layer_version_arn(
                 self,
                 "HeartRatePandasLayer",
                 pandas_layer_arn
-            )]
+            )],
+            environment={
+                "DESTINATION_BUCKET": processed_bucket.bucket_name,
+            }
         )
 
         self.step_function = lambda_.Function(
@@ -60,13 +74,18 @@ class LambdaFunctions(Construct):
             "AlbanyHealthStepLambdaFunctionDev",
             function_name="albanyHealth-step-lambda-function-dev",
             runtime=lambda_.Runtime.PYTHON_3_13,
-            handler="main.handler",
+            handler="main.lambda_handler",
             code=lambda_.Code.from_asset(f"{services_base_path}/albanyHealth-step-lambda-function"),
+            timeout=Duration.seconds(300),  # 5 minutes
+            memory_size=1024,  # 1024 MB - more memory for faster pandas processing
             layers=[lambda_.LayerVersion.from_layer_version_arn(
                 self,
                 "StepsPandasLayer",
                 pandas_layer_arn
-            )]
+            )],
+            environment={
+                "DESTINATION_BUCKET": processed_bucket.bucket_name,
+            }
         )
 
         self.sleep_function = lambda_.Function(
@@ -74,13 +93,18 @@ class LambdaFunctions(Construct):
             "AlbanyHealthSleepLambdaFunctionDev",
             function_name="albanyHealth-sleep-lambda-function-dev",
             runtime=lambda_.Runtime.PYTHON_3_13,
-            handler="main.handler",
+            handler="main.lambda_handler",
             code=lambda_.Code.from_asset(f"{services_base_path}/albanyHealth-sleep-lambda-function"),
+            timeout=Duration.seconds(300),  # 5 minutes
+            memory_size=1024,  # 1024 MB - more memory for faster pandas processing
             layers=[lambda_.LayerVersion.from_layer_version_arn(
                 self,
                 "SleepPandasLayer",
                 pandas_layer_arn
-            )]
+            )],
+            environment={
+                "DESTINATION_BUCKET": processed_bucket.bucket_name,
+            }
         )
 
         self.other_metrics_function = lambda_.Function(
@@ -88,13 +112,18 @@ class LambdaFunctions(Construct):
             "AlbanyHealthOtherMetricsLambdaFunctionDev",
             function_name="albanyHealth-other-metrics-lambda-function-dev",
             runtime=lambda_.Runtime.PYTHON_3_13,
-            handler="main.handler",
+            handler="main.lambda_handler",
             code=lambda_.Code.from_asset(f"{services_base_path}/albanyHealth-other-metrics-lambda-function"),
+            timeout=Duration.seconds(300),  # 5 minutes
+            memory_size=1024,  # 1024 MB - more memory for faster pandas processing
             layers=[lambda_.LayerVersion.from_layer_version_arn(
                 self,
                 "OtherMetricsPandasLayer",
                 pandas_layer_arn
-            )]
+            )],
+            environment={
+                "DESTINATION_BUCKET": processed_bucket.bucket_name,
+            }
         )
 
         self.data_inactivity_checker_function = lambda_.Function(
@@ -102,8 +131,10 @@ class LambdaFunctions(Construct):
             "AlbanyHealthDataInactivityCheckerLambdaFunctionDev",
             function_name="albanyHealth-data-inactivity-checker-lambda-function-dev",
             runtime=lambda_.Runtime.PYTHON_3_13,
-            handler="main.handler",
-            code=lambda_.Code.from_asset(f"{services_base_path}/albanyHealth-data-inactivity-checker-lambda-function")
+            handler="main.lambda_handler",
+            code=lambda_.Code.from_asset(f"{services_base_path}/albanyHealth-data-inactivity-checker-lambda-function"),
+            timeout=Duration.seconds(300),  # 5 minutes
+            memory_size=512,  # 512 MB - moderate memory for batch processing
         )
 
         # Create an IAM policy statement for the SQSs queue to invoke the function
@@ -153,13 +184,34 @@ class LambdaFunctions(Construct):
         processed_bucket.grant_write(self.step_function)
         processed_bucket.grant_write(self.sleep_function)
         processed_bucket.grant_write(self.other_metrics_function)
+        
+        # Grant read and write access to the processed_bucket for the data inactivity checker function
+        # It needs ListBucket permission to check for batch.json files and read/write them
+        processed_bucket.grant_read(self.data_inactivity_checker_function)
         processed_bucket.grant_write(self.data_inactivity_checker_function)
 
 
 
-        self.main_router_function.log_group.apply_removal_policy(RemovalPolicy.DESTROY)
-        self.heart_rate_function.log_group.apply_removal_policy(RemovalPolicy.DESTROY)
-        self.step_function.log_group.apply_removal_policy(RemovalPolicy.DESTROY)
-        self.sleep_function.log_group.apply_removal_policy(RemovalPolicy.DESTROY)
-        self.other_metrics_function.log_group.apply_removal_policy(RemovalPolicy.DESTROY)
-        self.data_inactivity_checker_function.log_group.apply_removal_policy(RemovalPolicy.DESTROY)
+        # Apply removal policy to log groups
+        # With useCdkManagedLogGroup flag enabled, CDK automatically creates log groups as CloudFormation resources
+        # We explicitly set DESTROY removal policy so log groups are deleted when stack is deleted
+        # This ensures clean stack deletion - log groups will be automatically removed with cdk destroy
+        
+        # Apply removal policy to all Lambda function log groups
+        lambda_functions = [
+            self.main_router_function,
+            self.heart_rate_function,
+            self.step_function,
+            self.sleep_function,
+            self.other_metrics_function,
+            self.data_inactivity_checker_function
+        ]
+        
+        for func in lambda_functions:
+            # With useCdkManagedLogGroup, log groups are automatically created and managed by CDK
+            # Access the log group and apply DESTROY removal policy
+            # This ensures log groups are deleted when the stack is destroyed
+            if hasattr(func, 'log_group') and func.log_group is not None:
+                # Apply removal policy to the log group
+                # This will ensure the log group is deleted on cdk destroy
+                func.log_group.apply_removal_policy(RemovalPolicy.DESTROY)
