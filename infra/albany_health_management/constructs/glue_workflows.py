@@ -31,11 +31,13 @@ class GlueWorkflows(Construct):
             "AlbanyHealthGarmin-Data-Delete-Glue-Job",
         ]
 
-        # On-demand trigger to kick off the Garmin workflow
+        # Event-based trigger to allow EventBridge to start the Garmin workflow
+        # EVENT triggers fire when EventBridge calls glue:NotifyEvent
+        # This is the starting trigger for the workflow (only one starting trigger allowed)
         glue.CfnTrigger(
             self,
-            "GarminOnDemandTrigger",
-            type="ON_DEMAND",
+            "GarminEventTrigger",
+            type="EVENT",
             workflow_name=garmin_workflow.name,
             actions=[
                 glue.CfnTrigger.ActionProperty(
@@ -74,10 +76,13 @@ class GlueWorkflows(Construct):
             "AlbanyHealthGarmin-BBI-Delete-Data-Glue-Job",
         ]
 
+        # Event-based trigger to allow EventBridge to start the BBI workflow
+        # EVENT triggers fire when EventBridge calls glue:NotifyEvent
+        # This is the starting trigger for the workflow (only one starting trigger allowed)
         glue.CfnTrigger(
             self,
-            "BBIOnDemandTrigger",
-            type="ON_DEMAND",
+            "BBIEventTrigger",
+            type="EVENT",
             workflow_name=bbi_workflow.name,
             actions=[
                 glue.CfnTrigger.ActionProperty(

@@ -36,9 +36,10 @@ class EventBridgeRules(Construct):
             assumed_by=iam.ServicePrincipal("events.amazonaws.com"),
         )
 
+        # EventBridge needs glue:NotifyEvent permission to trigger Glue workflows
         eventbridge_to_glue_role.add_to_policy(
             iam.PolicyStatement(
-                actions=["glue:StartWorkflowRun"],
+                actions=["glue:NotifyEvent"],
                 resources=[
                     bbi_workflow_arn,
                     garmin_workflow_arn,
@@ -58,6 +59,7 @@ class EventBridgeRules(Construct):
             "GarminBBIWorkflowRule",
             name=processing_rule_name,  # This sets the exact rule name in AWS
             description="Trigger AlbanyHealthGarminBBIWorkflow",
+            state="ENABLED",  # Explicitly enable the rule
             event_pattern={
                 "source": ["lambda"],
                 "detail-type": ["AlbanyHealthGarminBBIWorkflow"],
@@ -78,6 +80,7 @@ class EventBridgeRules(Construct):
             "GarminHealthMetricsWorkflowRule",
             name=completion_rule_name,  # This sets the exact rule name in AWS
             description="Trigger AlbanyHealthGarminHealthMetricsWorkflow",
+            state="ENABLED",  # Explicitly enable the rule
             event_pattern={
                 "source": ["lambda"],
                 "detail-type": ["AlbanyHealthGarminHealthMetricsWorkflow"],

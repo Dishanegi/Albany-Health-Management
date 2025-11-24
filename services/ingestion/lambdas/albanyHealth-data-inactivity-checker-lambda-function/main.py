@@ -14,19 +14,23 @@ import random
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-# Expected file counts per patient
-EXPECTED_FILE_COUNTS = {
-    'garmin-device-stress': 7,
-    'garmin-device-step': 7,
-    'garmin-device-respiration': 7,
-    'garmin-device-pulse-ox': 7,
-    'garmin-device-heart-rate': 7,
-    'garmin-connect-sleep-stage': 1
-}
+# Function to get expected file counts from environment variables
+def get_expected_file_counts() -> Dict[str, int]:
+    """
+    Get expected file counts per patient from environment variables.
+    Sleep-stage is always 1, others are configurable via env vars.
+    """
+    return {
+        'garmin-device-stress': int(os.environ.get('EXPECTED_STRESS_FILES', '7')),
+        'garmin-device-step': int(os.environ.get('EXPECTED_STEP_FILES', '7')),
+        'garmin-device-respiration': int(os.environ.get('EXPECTED_RESPIRATION_FILES', '7')),
+        'garmin-device-pulse-ox': int(os.environ.get('EXPECTED_PULSE_OX_FILES', '7')),
+        'garmin-device-heart-rate': int(os.environ.get('EXPECTED_HEART_RATE_FILES', '7')),
+        'garmin-connect-sleep-stage': 1  # Always 1, not configurable
+    }
 
 # Completion strategy configuration
 COMPLETION_THRESHOLD_PERCENTAGE = 80
-TOTAL_EXPECTED_FILES_PER_PATIENT = sum(EXPECTED_FILE_COUNTS.values())
 
 # Retry configuration for race condition handling
 MAX_RETRY_ATTEMPTS = 5
@@ -300,7 +304,13 @@ def process_s3_event_with_race_protection(s3_record: Dict[str, Any], s3_client, 
         
         # Check if batch just became complete and trigger EventBridge
         batch_completed = False
-        if update_result.get('batch_complete') and update_result.get('batch_newly_completed'):
+        batch_complete = update_result.get('batch_complete', False)
+        batch_newly_completed = update_result.get('batch_newly_completed', False)
+        
+        logger.info(f"Checking EventBridge trigger condition for batch {batch_info['batch_folder']}: "
+                   f"batch_complete={batch_complete}, batch_newly_completed={batch_newly_completed}")
+        
+        if batch_complete and batch_newly_completed:
             logger.info(f"Batch {batch_info['batch_folder']} just became complete! Triggering EventBridge rules...")
             
             eventbridge_results = trigger_batch_complete_events(
@@ -312,6 +322,9 @@ def process_s3_event_with_race_protection(s3_record: Dict[str, Any], s3_client, 
             
             batch_completed = True
             update_result['eventbridge_results'] = eventbridge_results
+        else:
+            logger.info(f"EventBridge NOT triggered for batch {batch_info['batch_folder']}: "
+                       f"batch_complete={batch_complete}, batch_newly_completed={batch_newly_completed}")
         
         # Get object metadata for S3 native events
         try:
@@ -370,6 +383,9 @@ def update_batch_json_with_race_protection(s3_client, bucket_name: str, batch_in
     
     logger.info(f"Updating batch.json with race protection: {batch_json_key}")
     
+    # Get expected file counts once at the beginning for consistency throughout the function
+    expected_file_counts = get_expected_file_counts()
+    
     for attempt in range(MAX_RETRY_ATTEMPTS):
         try:
             # Step 1: Get current batch.json with ETag for conditional updates
@@ -420,10 +436,10 @@ def update_batch_json_with_race_protection(s3_client, bucket_name: str, batch_in
             # Initialize patient if not exists
             if patient_id not in batch_data['patients']:
                 batch_data['patients'][patient_id] = {
-                    'file_counts': {ft: 0 for ft in EXPECTED_FILE_COUNTS.keys()},
+                    'file_counts': {ft: 0 for ft in expected_file_counts.keys()},
                     'processed_files': [],
                     'total_files': 0,
-                    'expected_files': sum(EXPECTED_FILE_COUNTS.values()),
+                    'expected_files': sum(expected_file_counts.values()),
                     'is_complete': False,
                     'first_file_received': datetime.utcnow().isoformat(),
                     'last_file_received': datetime.utcnow().isoformat()
@@ -463,7 +479,7 @@ def update_batch_json_with_race_protection(s3_client, bucket_name: str, batch_in
             patient_meets_threshold = patient_completion_percentage >= COMPLETION_THRESHOLD_PERCENTAGE
             patient_traditional_complete = all(
                 patient_data['file_counts'][ft] >= expected_count 
-                for ft, expected_count in EXPECTED_FILE_COUNTS.items()
+                for ft, expected_count in expected_file_counts.items()
             )
             
             patient_complete = patient_meets_threshold or patient_traditional_complete
@@ -485,7 +501,7 @@ def update_batch_json_with_race_protection(s3_client, bucket_name: str, batch_in
             total_files_in_batch = sum(
                 sum(p['file_counts'].values()) for p in batch_data['patients'].values()
             )
-            total_expected_files_in_batch = total_patients * TOTAL_EXPECTED_FILES_PER_PATIENT
+            total_expected_files_in_batch = total_patients * sum(expected_file_counts.values())
             batch_completion_percentage = (total_files_in_batch / total_expected_files_in_batch) * 100 if total_expected_files_in_batch > 0 else 0
             
             batch_newly_completed = False
@@ -622,7 +638,8 @@ def parse_object_key(object_key: str) -> Dict[str, Any]:
         file_type = path_parts[2]
         filename = path_parts[3]
         
-        if file_type not in EXPECTED_FILE_COUNTS:
+        expected_file_counts = get_expected_file_counts()
+        if file_type not in expected_file_counts:
             logger.warning(f"Unknown file type: {file_type}")
             return None
         
@@ -679,10 +696,16 @@ def trigger_batch_complete_events(eventbridge_client, bucket_name: str, batch_in
         batch_folder = batch_info['batch_folder']
         completion_timestamp = datetime.utcnow().isoformat()
         
-        # Event 1: Batch Processing Complete
+        # Build base event structure - only include EventBusName if not default
+        base_event_structure = {}
+        if eventbus_name and eventbus_name != 'default':
+            base_event_structure['EventBusName'] = eventbus_name
+        
+        # Event 1: Batch Processing Complete - matches completion rule pattern
+        # EventBridge rule expects: source=["lambda"], detail-type=["AlbanyHealthGarminHealthMetricsWorkflow"]
         event_1 = {
-            'Source': 'garmin.batch.processor',
-            'DetailType': 'Batch Processing Complete',
+            'Source': 'lambda',
+            'DetailType': 'AlbanyHealthGarminHealthMetricsWorkflow',
             'Detail': json.dumps({
                 'batchId': batch_folder,
                 'bucketName': bucket_name,
@@ -698,13 +721,14 @@ def trigger_batch_complete_events(eventbridge_client, bucket_name: str, batch_in
                     'targetRule': completion_rule_name
                 }
             }),
-            'EventBusName': eventbus_name
+            **base_event_structure
         }
         
-        # Event 2: Batch Ready for Processing
+        # Event 2: Batch Ready for Processing - matches processing rule pattern
+        # EventBridge rule expects: source=["lambda"], detail-type=["AlbanyHealthGarminBBIWorkflow"]
         event_2 = {
-            'Source': 'garmin.data.pipeline',
-            'DetailType': 'Batch Ready for Processing',
+            'Source': 'lambda',
+            'DetailType': 'AlbanyHealthGarminBBIWorkflow',
             'Detail': json.dumps({
                 'batchId': batch_folder,
                 'bucketName': bucket_name,
@@ -717,8 +741,8 @@ def trigger_batch_complete_events(eventbridge_client, bucket_name: str, batch_in
                         sum(patient_counts.values()) 
                         for patient_counts in update_result.get('patient_file_counts', {}).values()
                     ),
-                    'expectedFiles': sum(EXPECTED_FILE_COUNTS.values()) * len(update_result.get('patient_file_counts', {})),
-                    'fileTypeBreakdown': EXPECTED_FILE_COUNTS,
+                    'expectedFiles': sum(get_expected_file_counts().values()) * len(update_result.get('patient_file_counts', {})),
+                    'fileTypeBreakdown': get_expected_file_counts(),
                     'patientFileBreakdown': update_result.get('patient_file_counts', {})
                 },
                 'metadata': {
@@ -729,24 +753,35 @@ def trigger_batch_complete_events(eventbridge_client, bucket_name: str, batch_in
                     'targetRule': processing_rule_name
                 }
             }),
-            'EventBusName': eventbus_name
+            **base_event_structure
         }
         
         # Send both events to EventBridge
         events_to_send = [event_1, event_2]
+        
+        # Log the exact event structure being sent for debugging
+        logger.info(f"DEBUG: Sending EventBridge events for batch {batch_folder}")
+        logger.info(f"DEBUG: Event 1 structure - Source: {event_1.get('Source')}, DetailType: {event_1.get('DetailType')}, EventBusName: {event_1.get('EventBusName', 'default (omitted)')}")
+        logger.info(f"DEBUG: Event 2 structure - Source: {event_2.get('Source')}, DetailType: {event_2.get('DetailType')}, EventBusName: {event_2.get('EventBusName', 'default (omitted)')}")
+        logger.info(f"DEBUG: Expected rule patterns - Rule 1: source=['lambda'], detail-type=['AlbanyHealthGarminHealthMetricsWorkflow']")
+        logger.info(f"DEBUG: Expected rule patterns - Rule 2: source=['lambda'], detail-type=['AlbanyHealthGarminBBIWorkflow']")
         
         response = eventbridge_client.put_events(Entries=events_to_send)
         
         # Check for any failed events
         failed_events = response.get('FailedEntryCount', 0)
         
+        # Log full response for debugging
+        logger.info(f"DEBUG: EventBridge put_events response: {json.dumps(response, default=str)}")
+        
         if failed_events > 0:
             logger.error(f"Failed to send {failed_events} events to EventBridge")
             logger.error(f"Failed entries: {response.get('Entries', [])}")
         else:
             logger.info(f"Successfully sent 2 different events to EventBridge for batch {batch_folder}")
-            logger.info(f"Event 1: Targeting rule '{completion_rule_name}'")
-            logger.info(f"Event 2: Targeting rule '{processing_rule_name}'")
+            logger.info(f"Event 1: Targeting rule '{completion_rule_name}' with source='lambda', detail-type='AlbanyHealthGarminHealthMetricsWorkflow'")
+            logger.info(f"Event 2: Targeting rule '{processing_rule_name}' with source='lambda', detail-type='AlbanyHealthGarminBBIWorkflow'")
+            logger.info(f"DEBUG: Check EventBridge console to verify rules are ENABLED and matching these events")
         
         return {
             'events_sent': len(events_to_send),
@@ -759,16 +794,16 @@ def trigger_batch_complete_events(eventbridge_client, bucket_name: str, batch_in
             'event_details': [
                 {
                     'event_number': 1,
-                    'source': 'garmin.batch.processor',
-                    'detail_type': 'Batch Processing Complete',
+                    'source': 'lambda',
+                    'detail_type': 'AlbanyHealthGarminHealthMetricsWorkflow',
                     'batch_id': batch_folder,
                     'purpose': 'Completion notification',
                     'target_rule': completion_rule_name
                 },
                 {
                     'event_number': 2,
-                    'source': 'garmin.data.pipeline', 
-                    'detail_type': 'Batch Ready for Processing',
+                    'source': 'lambda', 
+                    'detail_type': 'AlbanyHealthGarminBBIWorkflow',
                     'batch_id': batch_folder,
                     'purpose': 'Processing trigger',
                     'target_rule': processing_rule_name

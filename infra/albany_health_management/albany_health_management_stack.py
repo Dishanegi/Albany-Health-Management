@@ -39,8 +39,8 @@ class AlbanyHealthManagementStack(Stack):
         )
         
 
-        # Create Glue jobs
-        glue_jobs = GlueJobs(self, "GlueJobs")
+        # Create Glue jobs with S3 bucket access
+        glue_jobs = GlueJobs(self, "GlueJobs", s3_buckets=s3_buckets)
 
         # Create Glue workflows
         glue_workflows = GlueWorkflows(
@@ -68,6 +68,29 @@ class AlbanyHealthManagementStack(Stack):
         lambda_functions.data_inactivity_checker_function.add_environment(
             "EVENTBRIDGE_BUS_NAME", 
             "default"
+        )
+        
+        # Add expected file count environment variables (configurable, defaults to 7)
+        # Sleep-stage is always 1 and not configurable
+        lambda_functions.data_inactivity_checker_function.add_environment(
+            "EXPECTED_STRESS_FILES", 
+            "7"
+        )
+        lambda_functions.data_inactivity_checker_function.add_environment(
+            "EXPECTED_STEP_FILES", 
+            "7"
+        )
+        lambda_functions.data_inactivity_checker_function.add_environment(
+            "EXPECTED_RESPIRATION_FILES", 
+            "7"
+        )
+        lambda_functions.data_inactivity_checker_function.add_environment(
+            "EXPECTED_PULSE_OX_FILES", 
+            "7"
+        )
+        lambda_functions.data_inactivity_checker_function.add_environment(
+            "EXPECTED_HEART_RATE_FILES", 
+            "7"
         )
 
         # Create an IAM role for S3 to send messages to SQS
