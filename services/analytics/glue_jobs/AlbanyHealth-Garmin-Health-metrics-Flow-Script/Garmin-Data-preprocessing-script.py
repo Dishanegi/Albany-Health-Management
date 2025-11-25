@@ -64,9 +64,21 @@ try:
     job = Job(glueContext)
     job.init(args["JOB_NAME"], args)
 
-    # S3 bucket and output path
-    source_bucket_name = "albanyhealthprocesseds3bucket-dev"
-    target_bucket_name = "albanyhealthmergedbucket"
+    # Parse optional arguments from sys.argv (default arguments from CDK)
+    def get_optional_arg(key, default):
+        """Get optional argument from sys.argv"""
+        try:
+            idx = sys.argv.index(f"--{key}")
+            if idx + 1 < len(sys.argv):
+                return sys.argv[idx + 1]
+        except ValueError:
+            pass
+        return default
+
+    # S3 bucket and output path - using environment variables
+    # Get bucket names from default arguments passed by CDK, with fallback defaults
+    source_bucket_name = get_optional_arg("SOURCE_BUCKET", "albanyhealthprocessed-s3bucket-dev")
+    target_bucket_name = get_optional_arg("TARGET_BUCKET", "albanyhealthmerged-s3bucket-dev")
     output_path = f"s3://{source_bucket_name}/initial_append"
 
     log_info("Job initialized successfully")

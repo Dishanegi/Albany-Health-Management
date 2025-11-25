@@ -362,19 +362,24 @@ try:
     # Track job start time
     job_start_time = time.time()
     
-    # Get required parameters from job arguments
+    # Get required parameters from job arguments - using environment variables
     args = getResolvedOptions(sys.argv, ["JOB_NAME"])
     job_name = args["JOB_NAME"]
     
-    # Set bucket names
-    source_bucket_name = "albanyhealthbbiprocessingbucket"
-    destination_bucket_name = "albanyhealthbbimergedbucket"
+    # Parse optional arguments from sys.argv (default arguments from CDK)
+    def get_optional_arg(key, default):
+        """Get optional argument from sys.argv"""
+        try:
+            idx = sys.argv.index(f"--{key}")
+            if idx + 1 < len(sys.argv):
+                return sys.argv[idx + 1]
+        except ValueError:
+            pass
+        return default
     
-    # Override with parameters if provided
-    if "source_bucket" in args:
-        source_bucket_name = args["source_bucket"]
-    if "destination_bucket" in args:
-        destination_bucket_name = args["destination_bucket"]
+    # Get bucket names from default arguments passed by CDK, with fallback defaults
+    source_bucket_name = get_optional_arg("SOURCE_BUCKET", "albanyhealthbbiprocessing-s3bucket-dev")
+    destination_bucket_name = get_optional_arg("DESTINATION_BUCKET", "albanyhealthbbimerged-s3bucket-dev")
     
     # Initialize Spark context
     sc = SparkContext()

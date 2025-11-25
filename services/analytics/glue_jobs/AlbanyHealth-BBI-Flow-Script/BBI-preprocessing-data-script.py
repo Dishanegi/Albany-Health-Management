@@ -55,19 +55,31 @@ try:
     # Track job start time
     job_start_time = time.time()
     
-    # Get required parameters from job arguments
+    # Get required parameters from job arguments - using environment variables
     args = getResolvedOptions(sys.argv, ["JOB_NAME"])
     job_name = args["JOB_NAME"]
     
-    # Set default bucket names for Albany Health
-    source_bucket_name = "albanyhealthsources3bucket-dev"
-    destination_bucket_name = "albanyhealthbbiprocessingbucket"
+    # Parse optional arguments from sys.argv (default arguments from CDK)
+    def get_optional_arg(key, default):
+        """Get optional argument from sys.argv"""
+        try:
+            idx = sys.argv.index(f"--{key}")
+            if idx + 1 < len(sys.argv):
+                return sys.argv[idx + 1]
+        except ValueError:
+            pass
+        return default
     
-    # Override with parameters if provided
-    if "source_bucket" in args:
-        source_bucket_name = args["source_bucket"]
-    if "destination_bucket" in args:
-        destination_bucket_name = args["destination_bucket"]
+    # Debug: Log all arguments received
+    log_info(f"DEBUG: All sys.argv arguments: {sys.argv}")
+    
+    # Get bucket names from default arguments passed by CDK, with fallback defaults
+    source_bucket_name = get_optional_arg("SOURCE_BUCKET", "albanyhealthsource-s3bucket-dev")
+    destination_bucket_name = get_optional_arg("DESTINATION_BUCKET", "albanyhealthbbiprocessing-s3bucket-dev")
+    
+    # Debug: Log what was parsed
+    log_info(f"DEBUG: Parsed SOURCE_BUCKET: '{source_bucket_name}'")
+    log_info(f"DEBUG: Parsed DESTINATION_BUCKET: '{destination_bucket_name}'")
     
     # Initialize Spark context
     sc = SparkContext()
@@ -79,6 +91,10 @@ try:
     job.init(job_name, args)
     
     log_info(f"Job initialized - Source: {source_bucket_name}, Destination: {destination_bucket_name}")
+    log_info(f"VERIFY: Destination bucket name being used: '{destination_bucket_name}'")
+    log_info(f"VERIFY: Expected bucket: 'albanyhealthbbiprocessing-s3bucket-dev'")
+    if destination_bucket_name != "albanyhealthbbiprocessing-s3bucket-dev":
+        log_error(f"BUCKET NAME MISMATCH! Using: '{destination_bucket_name}' but expected: 'albanyhealthbbiprocessing-s3bucket-dev'")
     
     # List S3 files
     import boto3
@@ -364,6 +380,8 @@ try:
                         final_path = file_path
                         
                         log_info(f"Copying from {source_part_file} to {final_path}")
+                        log_info(f"VERIFY: Writing to bucket: '{destination_bucket_name}'")
+                        log_info(f"VERIFY: Final S3 path: s3://{destination_bucket_name}/{final_path}")
                         
                         # Use S3 copy operation
                         s3_client.copy_object(
@@ -371,6 +389,15 @@ try:
                             CopySource={"Bucket": destination_bucket_name, "Key": source_part_file},
                             Key=final_path
                         )
+                        
+                        # Verify the file was written successfully
+                        try:
+                            head_response = s3_client.head_object(Bucket=destination_bucket_name, Key=final_path)
+                            file_size = head_response.get('ContentLength', 'unknown')
+                            log_info(f"VERIFY: Successfully verified file exists at s3://{destination_bucket_name}/{final_path}")
+                            log_info(f"VERIFY: File size: {file_size} bytes")
+                        except Exception as verify_error:
+                            log_error(f"VERIFY: Could not verify file after write! Error: {str(verify_error)}")
                         
                         log_info(f"Successfully copied file to final destination: {final_path}")
                         
@@ -449,11 +476,20 @@ try:
     log_info("-" * 50)
     log_info(f"Source Bucket: {source_bucket_name}")
     log_info(f"Destination Bucket: {destination_bucket_name}")
+    log_info(f"VERIFY: All output files should be in: s3://{destination_bucket_name}/")
     log_info(f"Total Files Found: {len(bbi_files)}")
     log_info(f"Total Files Processed: {len(processed_files)}")
     log_info(f"Total Files Failed: {len(failed_files)}")
     log_info(f"Total Records Processed: {total_records_processed}")
     log_info(f"Job Duration: {job_duration} seconds")
+    
+    # List where files were written
+    if processed_files:
+        log_info("\nVERIFY: Files written to destination bucket:")
+        for file_path in processed_files[:10]:  # Show first 10
+            log_info(f"  s3://{destination_bucket_name}/{file_path}")
+        if len(processed_files) > 10:
+            log_info(f"  ... and {len(processed_files) - 10} more files")
     
     if processed_files:
         log_info("\nSuccessfully Processed Files:")

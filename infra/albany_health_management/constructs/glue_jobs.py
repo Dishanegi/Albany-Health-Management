@@ -1,4 +1,5 @@
 from aws_cdk import (
+    Stack,
     aws_glue as glue,
     aws_iam as iam,
     aws_s3_assets as s3_assets,
@@ -18,7 +19,7 @@ class GlueJobs(Construct):
         
         # Grant S3 permissions to Glue jobs if buckets are provided
         if s3_buckets:
-            # Grant read access to source bucket
+            # Grant read access to source bucket (includes GetObject and ListBucket)
             s3_buckets.source_bucket.grant_read(glue_job_role)
             
             # Grant read/write access (includes GetObject, PutObject, ListBucket)
@@ -27,8 +28,21 @@ class GlueJobs(Construct):
             s3_buckets.merged_bucket.grant_read_write(glue_job_role)
             s3_buckets.bbi_merged_bucket.grant_read_write(glue_job_role)
             
+            # Explicitly grant ListBucket permissions for all buckets
+            glue_job_role.add_to_policy(
+                iam.PolicyStatement(
+                    actions=["s3:ListBucket"],
+                    resources=[
+                        s3_buckets.source_bucket.bucket_arn,
+                        s3_buckets.processed_bucket.bucket_arn,
+                        s3_buckets.bbi_processing_bucket.bucket_arn,
+                        s3_buckets.merged_bucket.bucket_arn,
+                        s3_buckets.bbi_merged_bucket.bucket_arn,
+                    ],
+                )
+            )
+            
             # Explicitly grant delete permissions for buckets where delete operations are needed
-            # grant_read_write should include DeleteObject, but we add it explicitly to be certain
             glue_job_role.add_to_policy(
                 iam.PolicyStatement(
                     actions=["s3:DeleteObject"],
@@ -66,6 +80,26 @@ class GlueJobs(Construct):
                 resources=["*"],
             )
         )
+        
+        # Grant permission to read Glue scripts from CDK assets bucket
+        # CDK uploads the scripts to an assets bucket, and Glue needs to read them
+        stack = Stack.of(self)
+        glue_job_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["s3:GetObject"],
+                resources=[
+                    f"arn:aws:s3:::cdk-*-assets-{stack.account}-{stack.region}/*",
+                ],
+            )
+        )
+        glue_job_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["s3:ListBucket"],
+                resources=[
+                    f"arn:aws:s3:::cdk-*-assets-{stack.account}-{stack.region}",
+                ],
+            )
+        )
 
         # Define the script names and paths
         glue_scripts_base_path = "../services/analytics/glue_jobs"
@@ -85,19 +119,55 @@ class GlueJobs(Construct):
             for name, path in script_names_and_paths
         }
 
+        # Define default arguments for each Glue job with bucket names from environment variables
+        # Only set defaults if s3_buckets are provided
+        job_default_arguments = {}
+        if s3_buckets:
+            job_default_arguments = {
+                "AlbanyHealthGarmin-Data-Preprocessor-Glue-Job": {
+                    "--SOURCE_BUCKET": s3_buckets.processed_bucket.bucket_name,
+                    "--TARGET_BUCKET": s3_buckets.merged_bucket.bucket_name,
+                },
+                "AlbanyHealthGarmin-Data-Merge-Glue-Job": {
+                    "--SOURCE_BUCKET": s3_buckets.processed_bucket.bucket_name,
+                    "--TARGET_BUCKET": s3_buckets.merged_bucket.bucket_name,
+                },
+                "AlbanyHealthGarmin-Data-Delete-Glue-Job": {
+                    "--BUCKET_NAME": s3_buckets.processed_bucket.bucket_name,
+                },
+                "AlbanyHealthGarmin-BBI-Preprocessor-Glue-Job": {
+                    "--SOURCE_BUCKET": s3_buckets.source_bucket.bucket_name,
+                    "--DESTINATION_BUCKET": s3_buckets.bbi_processing_bucket.bucket_name,
+                },
+                "AlbanyHealthGarmin-BBI-Merge-Data-Glue-Job": {
+                    "--SOURCE_BUCKET": s3_buckets.bbi_processing_bucket.bucket_name,
+                    "--DESTINATION_BUCKET": s3_buckets.bbi_merged_bucket.bucket_name,
+                },
+                "AlbanyHealthGarmin-BBI-Delete-Data-Glue-Job": {
+                    "--BUCKET_NAME": s3_buckets.bbi_processing_bucket.bucket_name,
+                },
+            }
+
         # Create Glue jobs using the L2 construct
-        self.glue_jobs = {
-            name: glue.CfnJob(
-                self,
-                f"{name}Job",
-                name=name,
-                command=glue.CfnJob.JobCommandProperty(
+        self.glue_jobs = {}
+        for name, asset in script_assets.items():
+            job_props = {
+                "name": name,
+                "command": glue.CfnJob.JobCommandProperty(
                     name="glueetl",
                     script_location=asset.s3_object_url,
                     python_version="3",
                 ),
-                role=glue_job_role.role_arn,
-                glue_version="2.0",
+                "role": glue_job_role.role_arn,
+                "glue_version": "5.0",
+            }
+            
+            # Add default arguments if buckets are provided and job has defaults defined
+            if s3_buckets and name in job_default_arguments:
+                job_props["default_arguments"] = job_default_arguments[name]
+            
+            self.glue_jobs[name] = glue.CfnJob(
+                self,
+                f"{name}Job",
+                **job_props
             )
-            for name, asset in script_assets.items()
-        }

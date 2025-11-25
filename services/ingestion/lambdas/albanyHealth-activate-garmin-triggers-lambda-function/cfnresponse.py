@@ -1,0 +1,56 @@
+# Copyright 2016-2017 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License"). You
+# may not use this file except in compliance with the License. A copy of
+# the License is located at
+#
+#     http://aws.amazon.com/apache2.0/
+#
+# or in the "license" file accompanying this file. This file is
+# distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF
+# ANY KIND, either express or implied. See the License for the specific
+# language governing permissions and limitations under the License.
+
+from __future__ import print_function
+import json
+import urllib3
+import os
+
+SUCCESS = "SUCCESS"
+FAILED = "FAILED"
+
+http = urllib3.PoolManager()
+
+
+def send(event, context, responseStatus, responseData, physicalResourceId=None, noEcho=False, reason=None):
+    responseUrl = event['ResponseURL']
+
+    print(responseUrl)
+
+    responseBody = {
+        'Status': responseStatus,
+        'Reason': reason or ('See the details in CloudWatch Log Stream: ' + context.log_stream_name),
+        'PhysicalResourceId': physicalResourceId or context.log_stream_name,
+        'StackId': event['StackId'],
+        'RequestId': event['RequestId'],
+        'LogicalResourceId': event['LogicalResourceId'],
+        'NoEcho': noEcho,
+        'Data': responseData
+    }
+
+    json_responseBody = json.dumps(responseBody)
+
+    print("Response body:")
+    print(json_responseBody)
+
+    headers = {
+        'content-type': '',
+        'content-length': str(len(json_responseBody))
+    }
+
+    try:
+        response = http.request('PUT', responseUrl, body=json_responseBody.encode('utf-8'), headers=headers)
+        print("Status code:", response.status)
+    except Exception as e:
+        print("send(..) failed executing http.request(..):", str(e))
+

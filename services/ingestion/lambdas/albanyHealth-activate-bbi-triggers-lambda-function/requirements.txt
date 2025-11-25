@@ -1,0 +1,3 @@
+# AWS Lambda custom resource dependencies
+# urllib3 is needed for cfnresponse module
+urllib3>=1.26.0

@@ -15,8 +15,20 @@ spark = glueContext.spark_session
 job = Job(glueContext)
 job.init(args['JOB_NAME'], args)
 
-# IMPORTANT: Assign your bucket name here
-bucket_name = "albanyhealthprocesseds3bucket-dev" 
+# Parse optional arguments from sys.argv (default arguments from CDK)
+def get_optional_arg(key, default):
+    """Get optional argument from sys.argv"""
+    try:
+        idx = sys.argv.index(f"--{key}")
+        if idx + 1 < len(sys.argv):
+            return sys.argv[idx + 1]
+    except ValueError:
+        pass
+    return default
+
+# IMPORTANT: Use environment variable for bucket name
+# Get bucket name from default arguments passed by CDK, with fallback default
+bucket_name = get_optional_arg('BUCKET_NAME', 'albanyhealthprocessed-s3bucket-dev') 
 
 # Log function for tracking operations
 def log_info(message):
