@@ -46,7 +46,9 @@ class AlbanyHealthManagementStack(Stack):
         glue_workflows = GlueWorkflows(
             self,
             "GlueWorkflows",
-            glue_jobs.glue_jobs
+            glue_jobs.glue_jobs,
+            lambda_functions.activate_garmin_triggers_lambda,
+            lambda_functions.activate_bbi_triggers_lambda,
         )
 
         # Create EventBridge rules

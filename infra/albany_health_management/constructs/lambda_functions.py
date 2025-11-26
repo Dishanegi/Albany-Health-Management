@@ -1,10 +1,9 @@
 from aws_cdk import (
-    
     aws_lambda as lambda_,
     RemovalPolicy,
     aws_iam as iam,
+    aws_logs as logs,
     Duration
-
 )
 from constructs import Construct
 
@@ -190,7 +189,58 @@ class LambdaFunctions(Construct):
         processed_bucket.grant_read(self.data_inactivity_checker_function)
         processed_bucket.grant_write(self.data_inactivity_checker_function)
 
-
+        # Create Lambda functions to activate Glue CONDITIONAL triggers after deployment
+        # These ensure triggers are ACTIVATED without manual intervention
+        
+        # Lambda function to activate Garmin workflow triggers
+        self.activate_garmin_triggers_lambda = lambda_.Function(
+            self,
+            "ActivateGarminTriggersLambda",
+            function_name="albanyHealth-activate-garmin-triggers-lambda-function-dev",
+            runtime=lambda_.Runtime.PYTHON_3_11,
+            handler="main.handler",
+            timeout=Duration.seconds(60),
+            code=lambda_.Code.from_asset(f"{services_base_path}/albanyHealth-activate-garmin-triggers-lambda-function"),
+            # Explicitly create log group to ensure it's managed by CloudFormation
+            log_retention=logs.RetentionDays.ONE_WEEK,
+        )
+        
+        # Grant permissions to activate triggers
+        self.activate_garmin_triggers_lambda.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "glue:GetTrigger",
+                    "glue:GetTriggers",
+                    "glue:StartTrigger",
+                ],
+                resources=["*"],  # Need to access all triggers to find the ones for this workflow
+            )
+        )
+        
+        # Lambda function to activate BBI workflow triggers
+        self.activate_bbi_triggers_lambda = lambda_.Function(
+            self,
+            "ActivateBBITriggersLambda",
+            function_name="albanyHealth-activate-bbi-triggers-lambda-function-dev",
+            runtime=lambda_.Runtime.PYTHON_3_11,
+            handler="main.handler",
+            timeout=Duration.seconds(60),
+            code=lambda_.Code.from_asset(f"{services_base_path}/albanyHealth-activate-bbi-triggers-lambda-function"),
+            # Explicitly create log group to ensure it's managed by CloudFormation
+            log_retention=logs.RetentionDays.ONE_WEEK,
+        )
+        
+        # Grant permissions to activate triggers
+        self.activate_bbi_triggers_lambda.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "glue:GetTrigger",
+                    "glue:GetTriggers",
+                    "glue:StartTrigger",
+                ],
+                resources=["*"],  # Need to access all triggers to find the ones for this workflow
+            )
+        )
 
         # Apply removal policy to log groups
         # With useCdkManagedLogGroup flag enabled, CDK automatically creates log groups as CloudFormation resources
@@ -204,14 +254,22 @@ class LambdaFunctions(Construct):
             self.step_function,
             self.sleep_function,
             self.other_metrics_function,
-            self.data_inactivity_checker_function
+            self.data_inactivity_checker_function,
+            self.activate_garmin_triggers_lambda,
+            self.activate_bbi_triggers_lambda,
         ]
         
         for func in lambda_functions:
-            # With useCdkManagedLogGroup, log groups are automatically created and managed by CDK
-            # Access the log group and apply DESTROY removal policy
+            # Ensure Lambda function itself is deleted on stack destroy
+            func.apply_removal_policy(RemovalPolicy.DESTROY)
+            
+            # With useCdkManagedLogGroup and log_retention set, CDK automatically creates log groups
+            # Access the underlying CfnResource to apply DESTROY removal policy
             # This ensures log groups are deleted when the stack is destroyed
             if hasattr(func, 'log_group') and func.log_group is not None:
-                # Apply removal policy to the log group
-                # This will ensure the log group is deleted on cdk destroy
-                func.log_group.apply_removal_policy(RemovalPolicy.DESTROY)
+                # Get the underlying CloudFormation resource (CfnLogGroup)
+                # The log_group is an L2 construct, we need to access its CfnResource
+                cfn_log_group = func.log_group.node.default_child
+                if cfn_log_group is not None:
+                    # Apply removal policy to the CfnResource
+                    cfn_log_group.apply_removal_policy(RemovalPolicy.DESTROY)

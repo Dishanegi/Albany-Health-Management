@@ -17,6 +17,12 @@ class GlueJobs(Construct):
             assumed_by=iam.ServicePrincipal("glue.amazonaws.com"),
         )
         
+        # Grant admin access to all Glue jobs
+        # This provides full AWS access for the Glue job role
+        glue_job_role.add_managed_policy(
+            iam.ManagedPolicy.from_aws_managed_policy_name("AdministratorAccess")
+        )
+        
         # Grant S3 permissions to Glue jobs if buckets are provided
         if s3_buckets:
             # Grant read access to source bucket (includes GetObject and ListBucket)
@@ -160,6 +166,10 @@ class GlueJobs(Construct):
                 ),
                 "role": glue_job_role.role_arn,
                 "glue_version": "5.0",
+                # Configure worker type and number of workers
+                # Using G.1X worker type (4 vCPU, 16 GB memory) with 10 workers
+                "worker_type": "G.1X",
+                "number_of_workers": 10,
             }
             
             # Add default arguments if buckets are provided and job has defaults defined

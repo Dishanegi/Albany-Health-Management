@@ -21,13 +21,17 @@ def log_error(message, error_details=None):
         log_message += f"Details: {error_details}\n"
         log_message += f"Traceback: {traceback.format_exc()}\n"
     
-    print(log_message)
+    print(log_message, flush=True)  # Flush immediately to ensure CloudWatch capture
+    sys.stdout.flush()  # Explicit flush
+    sys.stderr.flush()  # Also flush stderr
 
 # Simple info logging to console
 def log_info(message):
     """Log information to console"""
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    print(f"[{timestamp}] INFO: {message}")
+    log_msg = f"[{timestamp}] INFO: {message}"
+    print(log_msg, flush=True)  # Flush immediately to ensure CloudWatch capture
+    sys.stdout.flush()  # Explicit flush
 
 # Extract participant ID from file path
 def extract_participant_id(file_path):
@@ -55,9 +59,17 @@ try:
     # Track job start time
     job_start_time = time.time()
     
+    # Immediately log that script has started - this helps debug if script runs at all
+    print("=" * 80, flush=True)
+    print("BBI PREPROCESSOR SCRIPT STARTING", flush=True)
+    print("=" * 80, flush=True)
+    sys.stdout.flush()
+    
     # Get required parameters from job arguments - using environment variables
     args = getResolvedOptions(sys.argv, ["JOB_NAME"])
     job_name = args["JOB_NAME"]
+    
+    log_info(f"Script started successfully. Job name: {job_name}")
     
     # Parse optional arguments from sys.argv (default arguments from CDK)
     def get_optional_arg(key, default):
@@ -513,5 +525,12 @@ try:
     log_info("Job completed successfully")
 
 except Exception as e:
-    log_error("Fatal error in main job flow", str(e))
+    # Ensure error is logged and visible
+    error_msg = f"Fatal error in main job flow: {str(e)}"
+    log_error(error_msg, str(e))
+    print(f"EXCEPTION TYPE: {type(e).__name__}", flush=True)
+    print(f"EXCEPTION MESSAGE: {str(e)}", flush=True)
+    traceback.print_exc()
+    sys.stdout.flush()
+    sys.stderr.flush()
     raise e  

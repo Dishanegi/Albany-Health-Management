@@ -1,15 +1,12 @@
 from aws_cdk import (
     aws_glue as glue,
-    aws_lambda as lambda_,
-    aws_iam as iam,
     aws_cloudformation as cfn,
     custom_resources as cr,
-    Duration,
 )
 from constructs import Construct
 
 class GlueWorkflows(Construct):
-    def __init__(self, scope: Construct, construct_id: str, glue_jobs, **kwargs) -> None:
+    def __init__(self, scope: Construct, construct_id: str, glue_jobs, activate_garmin_triggers_lambda, activate_bbi_triggers_lambda, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
         # Create Glue workflows
@@ -95,32 +92,8 @@ class GlueWorkflows(Construct):
                 # Subsequent conditional triggers depend on the previous conditional trigger
                 conditional_trigger.add_dependency(garmin_conditional_triggers[i - 1])
         
-        # Create a Lambda function to automatically activate CONDITIONAL triggers after deployment
-        # This ensures triggers are ACTIVATED without manual intervention
-        # Lambda function is defined in services/ingestion/lambdas/albanyHealth-activate-garmin-triggers-lambda-function/
-        activate_garmin_triggers_lambda = lambda_.Function(
-            self,
-            "ActivateGarminTriggersLambda",
-            function_name="albanyHealth-activate-garmin-triggers-lambda-function-dev",
-            runtime=lambda_.Runtime.PYTHON_3_11,
-            handler="main.handler",
-            timeout=Duration.seconds(60),
-            code=lambda_.Code.from_asset("../services/ingestion/lambdas/albanyHealth-activate-garmin-triggers-lambda-function"),
-        )
-        
-        # Grant permissions to activate triggers
-        # The Lambda needs permissions to get trigger information and activate triggers
-        activate_garmin_triggers_lambda.add_to_role_policy(
-            iam.PolicyStatement(
-                actions=[
-                    "glue:GetTrigger",
-                    "glue:GetTriggers",
-                    "glue:StartTrigger",
-                ],
-                resources=["*"],  # Need to access all triggers to find the ones for this workflow
-            )
-        )
-        
+        # Use the Lambda function passed from LambdaFunctions construct
+        # This Lambda automatically activates CONDITIONAL triggers after deployment
         # Create custom resource provider to activate triggers after deployment
         activate_garmin_provider = cr.Provider(
             self,
@@ -206,31 +179,8 @@ class GlueWorkflows(Construct):
                 # Subsequent conditional triggers depend on the previous conditional trigger
                 conditional_trigger.add_dependency(bbi_conditional_triggers[i - 1])
         
-        # Create a Lambda function to automatically activate BBI CONDITIONAL triggers after deployment
-        # Lambda function is defined in services/ingestion/lambdas/albanyHealth-activate-bbi-triggers-lambda-function/
-        activate_bbi_triggers_lambda = lambda_.Function(
-            self,
-            "ActivateBBITriggersLambda",
-            function_name="albanyHealth-activate-bbi-triggers-lambda-function-dev",
-            runtime=lambda_.Runtime.PYTHON_3_11,
-            handler="main.handler",
-            timeout=Duration.seconds(60),
-            code=lambda_.Code.from_asset("../services/ingestion/lambdas/albanyHealth-activate-bbi-triggers-lambda-function"),
-        )
-        
-        # Grant permissions to activate triggers
-        # The Lambda needs permissions to get trigger information and activate triggers
-        activate_bbi_triggers_lambda.add_to_role_policy(
-            iam.PolicyStatement(
-                actions=[
-                    "glue:GetTrigger",
-                    "glue:GetTriggers",
-                    "glue:StartTrigger",
-                ],
-                resources=["*"],  # Need to access all triggers to find the ones for this workflow
-            )
-        )
-        
+        # Use the Lambda function passed from LambdaFunctions construct
+        # This Lambda automatically activates BBI CONDITIONAL triggers after deployment
         # Create custom resource to activate triggers after all conditional triggers are created
         activate_bbi_provider = cr.Provider(
             self,

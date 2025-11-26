@@ -39,6 +39,7 @@ class S3Buckets(Construct):
             self,
             "AlbanyHealthMergedBucket",
             bucket_name="albanyhealthmerged-s3bucket-dev",
+            auto_delete_objects=True,
             removal_policy=RemovalPolicy.DESTROY,
         )
 
@@ -46,5 +47,6 @@ class S3Buckets(Construct):
             self,
             "AlbanyHealthBBIMergedBucket",
             bucket_name="albanyhealthbbimerged-s3bucket-dev",
+            auto_delete_objects=True,
             removal_policy=RemovalPolicy.DESTROY,
         )
