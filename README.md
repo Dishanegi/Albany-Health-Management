@@ -119,7 +119,7 @@ New Health Data Files Arrive
 
 1. **Navigate to the infrastructure folder**:
    ```bash
-   cd infra
+cd infra
    ```
 
 2. **Create a virtual environment** (isolated Python environment):
@@ -133,7 +133,7 @@ python3 -m venv .venv
 
 4. **Install required packages**:
    ```bash
-   pip install -r requirements.txt
+pip install -r requirements.txt
    ```
 
 ### Deploying the System
