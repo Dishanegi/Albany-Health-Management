@@ -193,6 +193,15 @@ class LambdaFunctions(Construct):
         # These ensure triggers are ACTIVATED without manual intervention
         
         # Lambda function to activate Garmin workflow triggers
+        # Explicitly create log group with DESTROY removal policy to ensure it's deleted on stack destroy
+        activate_garmin_log_group = logs.LogGroup(
+            self,
+            "ActivateGarminTriggersLogGroup",
+            log_group_name=f"/aws/lambda/albanyHealth-activate-garmin-triggers-lambda-function-dev",
+            retention=logs.RetentionDays.ONE_WEEK,
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+        
         self.activate_garmin_triggers_lambda = lambda_.Function(
             self,
             "ActivateGarminTriggersLambda",
@@ -201,8 +210,7 @@ class LambdaFunctions(Construct):
             handler="main.handler",
             timeout=Duration.seconds(60),
             code=lambda_.Code.from_asset(f"{services_base_path}/albanyHealth-activate-garmin-triggers-lambda-function"),
-            # Explicitly create log group to ensure it's managed by CloudFormation
-            log_retention=logs.RetentionDays.ONE_WEEK,
+            log_group=activate_garmin_log_group,
         )
         
         # Grant permissions to activate triggers
@@ -218,6 +226,15 @@ class LambdaFunctions(Construct):
         )
         
         # Lambda function to activate BBI workflow triggers
+        # Explicitly create log group with DESTROY removal policy to ensure it's deleted on stack destroy
+        activate_bbi_log_group = logs.LogGroup(
+            self,
+            "ActivateBBITriggersLogGroup",
+            log_group_name=f"/aws/lambda/albanyHealth-activate-bbi-triggers-lambda-function-dev",
+            retention=logs.RetentionDays.ONE_WEEK,
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+        
         self.activate_bbi_triggers_lambda = lambda_.Function(
             self,
             "ActivateBBITriggersLambda",
@@ -226,8 +243,7 @@ class LambdaFunctions(Construct):
             handler="main.handler",
             timeout=Duration.seconds(60),
             code=lambda_.Code.from_asset(f"{services_base_path}/albanyHealth-activate-bbi-triggers-lambda-function"),
-            # Explicitly create log group to ensure it's managed by CloudFormation
-            log_retention=logs.RetentionDays.ONE_WEEK,
+            log_group=activate_bbi_log_group,
         )
         
         # Grant permissions to activate triggers

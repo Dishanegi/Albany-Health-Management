@@ -11,7 +11,6 @@ from awsglue.dynamicframe import DynamicFrame
 from pyspark.sql.functions import lit, col, split, when
 import pyspark.sql.functions as F
 
-# Initialize error logging
 def log_error(message, error_details=None):
     """Log errors to S3 for debugging"""
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -29,14 +28,12 @@ def log_error(message, error_details=None):
     except Exception as e:
         print(f"Failed to write error log: {str(e)}")
 
-# Simple info logging to console instead of S3
 def log_info(message):
     """Log information to console"""
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     print(f"[{timestamp}] INFO: {message}")
 
 try:
-    # Initialize the job
     args = getResolvedOptions(sys.argv, ["JOB_NAME"])
     sc = SparkContext()
     glueContext = GlueContext(sc)
@@ -44,7 +41,6 @@ try:
     job = Job(glueContext)
     job.init(args["JOB_NAME"], args)
 
-    # Parse optional arguments from sys.argv (default arguments from CDK)
     def get_optional_arg(key, default):
         """Get optional argument from sys.argv"""
         try:
@@ -55,32 +51,27 @@ try:
             pass
         return default
 
-    # S3 bucket and paths - using environment variables
-    # Get bucket names from default arguments passed by CDK, with fallback defaults
     source_bucket_name = get_optional_arg("SOURCE_BUCKET", "albanyhealthprocessed-s3bucket-dev")
     target_bucket_name = get_optional_arg("TARGET_BUCKET", "albanyhealthmerged-s3bucket-dev")
-    input_path = f"s3://{source_bucket_name}/initial_append"  # Changed from temp_input_path
+    input_path = f"s3://{source_bucket_name}/initial_append"
     output_path = f"s3://{target_bucket_name}/merged_garmin_data"
 
     log_info("Job initialized successfully")
 
-    # First, list all patient folders in initial_append
     s3_client = boto3.client("s3")
     paginator = s3_client.get_paginator('list_objects_v2')
     
-    # Function to prepare DataFrames for joining
     def prepare_for_join(df, data_type):
+        """Prepare DataFrame for joining by standardizing column names and extracting required fields"""
         if df is None:
             return None
             
-        # Log columns before prep
         columns_before = df.columns
         log_info(f"Columns before prep for {data_type}: {columns_before}")
 
-        # Check if participantId and timestamp columns exist
+        # Extract participant_id and timestamp from composite key if needed
         if "participant_id" not in df.columns or "timestamp" not in df.columns:
             if "participantid_timestamp" in df.columns:
-                # Extract if they don't exist but composite key does
                 df = df.withColumn(
                     "participant_id",
                     split(col("participantid_timestamp"), "_").getItem(0),
@@ -92,10 +83,9 @@ try:
                 log_error(f"ERROR: Required joining columns missing in {data_type} data")
                 raise Exception(f"Join columns not found in {data_type} data")
 
-        # Preserve unixTimestampInMs column if it exists
         has_unix_timestamp = "unixTimestampInMs" in df.columns
 
-        # Select columns specific to each data type
+        # Standardize column names for each data type, handling variations in source data
         try:
             if data_type == "garmin-device-heart-rate":
                 if "beatsPerMinute" in df.columns:
@@ -192,28 +182,24 @@ try:
             else:
                 select_cols = ["participant_id", "timestamp"]
 
-            # Add unixTimestampInMs if it exists
             if has_unix_timestamp:
                 select_cols.append("unixTimestampInMs")
 
-            # Select the final columns
             prepped_df = df.select(*select_cols)
 
-            # Log columns after prep
             columns_after = prepped_df.columns
             log_info(f"Columns after prep for {data_type}: {columns_after}")
 
             return prepped_df
         except Exception as e:
             log_error(f"Error preparing {data_type} data for join", str(e))
-            # Return basic DataFrame as fallback
             basic_cols = ["participant_id", "timestamp"]
             if has_unix_timestamp:
                 basic_cols.append("unixTimestampInMs")
             return df.select(*basic_cols)
 
-    # Function to join metric data
     def join_metric_data(merged_df, data_type, metric_cols):
+        """Join metric data to merged DataFrame, filling nulls with default values"""
         if data_type in prepared_dfs:
             try:
                 df = prepared_dfs[data_type]
@@ -222,7 +208,7 @@ try:
 
                 merged_df = merged_df.join(df_slim, ["participant_id", "timestamp"], "left")
                 
-                # Add default values for null columns
+                # Fill null values with defaults: 0 for numeric, "none" for sleepType
                 for col_name in metric_cols:
                     if col_name in df.columns:
                         if col_name != "sleepType":
@@ -254,25 +240,23 @@ try:
         return merged_df
 
     try:
-        # Get all patient folders
+        # Discover all patient folders in initial_append directory
         patient_folders = set()
         prefix = "initial_append/"
         
         for page in paginator.paginate(Bucket=source_bucket_name, Prefix=prefix):
             if "Contents" in page:
                 for obj in page["Contents"]:
-                    # Extract patient ID from path
+                    # Extract patient ID from path: initial_append/patient_id/file.csv
                     path_parts = obj["Key"].split("/")
-                    if len(path_parts) > 2:  # initial_append/patient_id/file.csv
+                    if len(path_parts) > 2:
                         patient_folders.add(path_parts[1])
         
         log_info(f"Found {len(patient_folders)} patient folders to process")
         
-        # Process each patient's data separately
         for patient_id in patient_folders:
             log_info(f"Processing data for patient: {patient_id}")
             
-            # List of data types to process
             data_types = [
                 "garmin-device-heart-rate",
                 "garmin-connect-sleep-stage",
@@ -289,7 +273,6 @@ try:
                     log_info(f"Reading {data_type} data for patient {patient_id}...")
                     input_file = f"{input_path}/{patient_id}/{data_type}.csv"
                     
-                    # Read the data
                     df = glueContext.create_dynamic_frame.from_options(
                         format_options={
                             "quoteChar": '"',
@@ -302,7 +285,6 @@ try:
                         transformation_ctx=f"{patient_id}_{data_type}_df",
                     ).toDF()
                     
-                    # Prepare the data for joining
                     prepared_dfs[data_type] = prepare_for_join(df, data_type)
                     if prepared_dfs[data_type] is not None:
                         log_info(f"Prepared {data_type} data with {prepared_dfs[data_type].count()} records for patient {patient_id}")
@@ -310,11 +292,10 @@ try:
                     log_error(f"Failed to process {data_type} data for patient {patient_id}", str(e))
                     prepared_dfs[data_type] = None
 
-            # Create a unified table of unique participantId-timestamp combinations
+            # Create base DataFrame with all unique participant_id-timestamp combinations across all data types
             unique_combinations = []
             for data_type, df in prepared_dfs.items():
                 if df is not None:
-                    # Create a new DataFrame with explicit column references
                     select_cols = [col("participant_id"), col("timestamp")]
                     if "unixTimestampInMs" in df.columns:
                         select_cols.append(col("unixTimestampInMs").alias(f"{data_type}_unixTimestampInMs"))
@@ -324,20 +305,18 @@ try:
                 log_error(f"No valid data to process for patient {patient_id}")
                 continue
 
-            # Create a base DataFrame with all unique participantId-timestamp combinations
+            # Full outer join to get all unique timestamp combinations
             base_df = unique_combinations[0]
             for i in range(1, len(unique_combinations)):
                 df_to_join = unique_combinations[i]
                 join_cols = ["participant_id", "timestamp"]
                 base_df = base_df.join(df_to_join, join_cols, "full_outer")
 
-            # Remove duplicates and handle unixTimestampInMs columns
             base_df = base_df.distinct()
             
-            # Select the first non-null unixTimestampInMs value from any of the joined columns
+            # Merge unixTimestampInMs from different data types (use first non-null value)
             unix_timestamp_cols = [c for c in base_df.columns if c.endswith("_unixTimestampInMs")]
             if unix_timestamp_cols:
-                # Create a coalesce expression to get the first non-null value
                 coalesce_expr = F.coalesce(*[col(c) for c in unix_timestamp_cols])
                 base_df = base_df.select(
                     col("participant_id"),
@@ -349,10 +328,9 @@ try:
             
             log_info(f"Created base DataFrame with {base_df.count()} unique participantId-timestamp combinations for patient {patient_id}")
 
-            # Now join each dataset with the metrics
+            # Join all metric data types to the base DataFrame
             merged_df = base_df
 
-            # Join each data type
             merged_df = join_metric_data(merged_df, "garmin-device-heart-rate", ["beatsPerMinute"])
             merged_df = join_metric_data(merged_df, "garmin-connect-sleep-stage", ["durationInMs", "sleepType"])
             merged_df = join_metric_data(merged_df, "garmin-device-step", ["steps", "totalSteps"])
@@ -360,13 +338,13 @@ try:
             merged_df = join_metric_data(merged_df, "garmin-device-stress", ["stressLevel"])
             merged_df = join_metric_data(merged_df, "garmin-device-pulse-ox", ["spo2"])
 
-            # Add participantid_timestamp back for backward compatibility
+            # Add composite key for backward compatibility
             merged_df = merged_df.withColumn(
                 "participantid_timestamp",
                 F.concat(col("participant_id"), lit("_"), col("timestamp")),
             )
             
-            # Set proper datatypes for all columns
+            # Cast all columns to proper data types
             merged_df = merged_df.withColumn("timestamp", col("timestamp").cast("string"))
             merged_df = merged_df.withColumn("participant_id", col("participant_id").cast("string"))
             if "unixTimestampInMs" in merged_df.columns:
@@ -381,8 +359,7 @@ try:
             merged_df = merged_df.withColumn("sleepType", col("sleepType").cast("string"))
             merged_df = merged_df.withColumn("participantid_timestamp", col("participantid_timestamp").cast("string"))
             
-            # Extract day and time from timestamp
-            # Extract day and time from timestamp
+            # Extract day and time from unix timestamp
             merged_df = merged_df.withColumn(
                 "day",
                 F.date_format(F.from_unixtime(F.col("unixTimestampInMs")/1000), "yyyy-MM-dd")
@@ -392,36 +369,33 @@ try:
                 F.date_format(F.from_unixtime(F.col("unixTimestampInMs")/1000), "HH:mm:ss")
             )
             
-            # Add this right after the above code to create the new participantId_date column:
-            # Create participantId_date column by concatenating participant_id and day
+            # Create participantId_date composite key
             merged_df = merged_df.withColumn(
                 "participantId_date",
                 F.concat(col("participant_id"), lit("_"), col("day"))
             )
             
-            # Log that we've added the new column
             log_info("Added participantId_date column")
             
-            # Update the column order list to include the new column
+            # Define column order for final output
             column_order = [
-                "participantid_timestamp",  # Composite key first
-                "participantId_date",       # New column we're adding
-                "participant_id",            # Primary identifiers
+                "participantid_timestamp",
+                "participantId_date",
+                "participant_id",
                 "timestamp",
-                "unixTimestampInMs",        # Time-related fields
-                "day",                      # New day column
-                "time",                     # New time column
-                "beatsPerMinute",           # Health metrics
+                "unixTimestampInMs",
+                "day",
+                "time",
+                "beatsPerMinute",
                 "stressLevel",
                 "steps",
                 "totalSteps",
                 "breathsPerMinute",
                 "spo2",
-                "durationInMs",             # Sleep-related fields
+                "durationInMs",
                 "sleepType"
             ]
             
-            # Select columns in the specified order
             missing_columns = [col for col in column_order if col not in merged_df.columns]
             if missing_columns:
                 log_info(f"Warning: Some columns in the desired order are missing: {missing_columns}")
@@ -432,15 +406,13 @@ try:
                 log_info(f"Found additional columns not in specified order: {extra_columns}")
                 column_order.extend(extra_columns)
             
-            # Reorder the columns
             merged_df = merged_df.select(*column_order)
             
-            # Log final schema
             final_columns = merged_df.columns
             log_info(f"Final columns in merged data after reordering: {final_columns}")
             log_info(f"Final record count: {merged_df.count()}")
 
-            # Order by unixTimestampInMs before writing
+            # Sort data chronologically before writing
             try:
                 log_info("Ordering data by unixTimestampInMs in ascending order")
                 if "unixTimestampInMs" in merged_df.columns:
@@ -456,7 +428,6 @@ try:
                 log_error(f"Error ordering data by unixTimestampInMs: {str(e)}")
                 log_info("Will continue with unordered data")
 
-            # Convert to dynamic frame for writing
             try:
                 log_info("Converting to dynamic frame for output")
                 merged_dynamic_frame = DynamicFrame.fromDF(
@@ -471,17 +442,15 @@ try:
                 log_info(f"Saved backup data to {output_final_path}")
                 raise e
 
-            # Write output for this patient
             try:
                 log_info(f"Writing merged data for patient {patient_id}")
                 
-                # Find the latest date from the 'day' column
+                # Determine output filename based on latest date in data
                 if "day" in merged_df.columns:
                     latest_date_df = merged_df.select(F.max("day").alias("latest_date"))
                     latest_date = latest_date_df.collect()[0]["latest_date"]
                     
                     if latest_date is not None:
-                        # Convert from yyyy-MM-dd to yyyyMMdd format
                         date_str = latest_date.replace("-", "")
                         log_info(f"Using latest date from data: {date_str}")
                     else:
@@ -491,27 +460,23 @@ try:
                     date_str = datetime.datetime.now().strftime("%Y%m%d")
                     log_info(f"No day column found, using current date: {date_str}")
                 
-                # Create patient-specific output folder
                 output_folder = f"{output_path}/{patient_id}"
                 output_filename = f"merged_file_{date_str}.csv"
                 
-                # Create a temporary folder for our part file
-                temp_folder = f"{output_path}/temp_merged_data_{patient_id}_{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}"
+                # Write to temp folder in processing bucket first, then copy to merged bucket
+                temp_folder = f"s3://{source_bucket_name}/temp_merged_data_{patient_id}_{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}"
                 
-                # Coalesce to 1 partition to create a single file
                 single_partition_df = merged_df.coalesce(1)
                 
-                # Write as a single CSV file to the temp folder
-                log_info(f"Writing merged data to temporary location {temp_folder}")
+                log_info(f"Writing merged data to temporary location in processing bucket: {temp_folder}")
                 single_partition_df.write.option("header", "true").option("quote", '"').option(
                     "sep", ","
                 ).mode("overwrite").csv(temp_folder)
                 
-                # Find the part file in the temp folder
-                temp_key_prefix = temp_folder.replace(f"s3://{target_bucket_name}/", "")
-                response = s3_client.list_objects_v2(Bucket=target_bucket_name, Prefix=temp_key_prefix)
+                # Find the generated part file and copy to final location
+                temp_key_prefix = temp_folder.replace(f"s3://{source_bucket_name}/", "")
+                response = s3_client.list_objects_v2(Bucket=source_bucket_name, Prefix=temp_key_prefix)
                 
-                # Find the actual CSV file
                 part_file = None
                 if "Contents" in response:
                     for obj in response["Contents"]:
@@ -520,30 +485,28 @@ try:
                             break
                 
                 if part_file:
-                    # Copy to final destination
                     target_key = f"{output_folder.replace(f's3://{target_bucket_name}/', '')}/{output_filename}"
                     
-                    # Check if file already exists
+                    # Handle filename collision by appending timestamp
                     try:
                         s3_client.head_object(Bucket=target_bucket_name, Key=target_key)
-                        # If file exists, add timestamp to filename
                         current_time = datetime.datetime.now().strftime("%H%M%S")
                         output_filename = f"merged_file_{date_str}_{current_time}.csv"
                         target_key = f"{output_folder.replace(f's3://{target_bucket_name}/', '')}/{output_filename}"
                         log_info(f"File already exists, using new name: {output_filename}")
                     except:
-                        # File doesn't exist, continue with original name
                         pass
                     
+                    # Copy from processing bucket to merged bucket
                     s3_client.copy_object(
                         Bucket=target_bucket_name,
-                        CopySource={"Bucket": target_bucket_name, "Key": part_file},
+                        CopySource={"Bucket": source_bucket_name, "Key": part_file},
                         Key=target_key
                     )
                     
-                    # Clean up temp files
+                    # Clean up temp files from processing bucket
                     for obj in response["Contents"]:
-                        s3_client.delete_object(Bucket=target_bucket_name, Key=obj["Key"])
+                        s3_client.delete_object(Bucket=source_bucket_name, Key=obj["Key"])
                     
                     log_info(f"Successfully saved merged data for patient {patient_id} as {output_filename}")
                     log_info(f"Total records for patient {patient_id}: {merged_df.count()}")
