@@ -140,22 +140,22 @@ pip install -r requirements.txt
 
 1. **First-time setup** (only needed once per AWS account/region):
    ```bash
-   cdk bootstrap
+cdk bootstrap
    ```
 
 2. **Preview changes** (see what will be created/updated):
    ```bash
-   cdk diff
+cdk diff
    ```
 
 3. **Deploy the system**:
    ```bash
-   cdk deploy
+cdk deploy
    ```
 
 4. **Remove the system** (when you want to delete everything):
    ```bash
-   cdk destroy
+cdk destroy
    ```
 
 ### Development Commands
