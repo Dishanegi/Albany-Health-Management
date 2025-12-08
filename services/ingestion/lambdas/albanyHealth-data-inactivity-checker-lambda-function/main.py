@@ -41,11 +41,14 @@ MAX_RETRY_DELAY = 2.0   # 2 second max delay
 def get_eventbridge_config():
     """
     Get EventBridge configuration from environment variables
+    Includes environment-specific detail-types to ensure events only match this environment's rules
     """
     return {
         'bus_name': os.environ.get('EVENTBRIDGE_BUS_NAME', 'default'),
         'completion_rule_name': os.environ.get('EVENTBRIDGE_COMPLETION_RULE_NAME', 'trigger-merge-patient-health-metrics'),
         'processing_rule_name': os.environ.get('EVENTBRIDGE_PROCESSING_RULE_NAME', 'trigger-patients-bbi-flow'),
+        'garmin_detail_type': os.environ.get('EVENTBRIDGE_GARMIN_DETAIL_TYPE', 'AlbanyHealthGarminHealthMetricsWorkflow'),
+        'bbi_detail_type': os.environ.get('EVENTBRIDGE_BBI_DETAIL_TYPE', 'AlbanyHealthGarminBBIWorkflow'),
     }
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
@@ -691,6 +694,8 @@ def trigger_batch_complete_events(eventbridge_client, bucket_name: str, batch_in
         eventbridge_config = get_eventbridge_config()
         completion_rule_name = eventbridge_config['completion_rule_name']
         processing_rule_name = eventbridge_config['processing_rule_name']
+        garmin_detail_type = eventbridge_config['garmin_detail_type']
+        bbi_detail_type = eventbridge_config['bbi_detail_type']
         eventbus_name = eventbridge_config['bus_name']
         
         batch_folder = batch_info['batch_folder']
@@ -702,10 +707,10 @@ def trigger_batch_complete_events(eventbridge_client, bucket_name: str, batch_in
             base_event_structure['EventBusName'] = eventbus_name
         
         # Event 1: Batch Processing Complete - matches completion rule pattern
-        # EventBridge rule expects: source=["lambda"], detail-type=["AlbanyHealthGarminHealthMetricsWorkflow"]
+        # EventBridge rule expects: source=["lambda"], detail-type=[environment-specific detail type]
         event_1 = {
             'Source': 'lambda',
-            'DetailType': 'AlbanyHealthGarminHealthMetricsWorkflow',
+            'DetailType': garmin_detail_type,
             'Detail': json.dumps({
                 'batchId': batch_folder,
                 'bucketName': bucket_name,
@@ -725,10 +730,10 @@ def trigger_batch_complete_events(eventbridge_client, bucket_name: str, batch_in
         }
         
         # Event 2: Batch Ready for Processing - matches processing rule pattern
-        # EventBridge rule expects: source=["lambda"], detail-type=["AlbanyHealthGarminBBIWorkflow"]
+        # EventBridge rule expects: source=["lambda"], detail-type=[environment-specific detail type]
         event_2 = {
             'Source': 'lambda',
-            'DetailType': 'AlbanyHealthGarminBBIWorkflow',
+            'DetailType': bbi_detail_type,
             'Detail': json.dumps({
                 'batchId': batch_folder,
                 'bucketName': bucket_name,
@@ -763,8 +768,8 @@ def trigger_batch_complete_events(eventbridge_client, bucket_name: str, batch_in
         logger.info(f"DEBUG: Sending EventBridge events for batch {batch_folder}")
         logger.info(f"DEBUG: Event 1 structure - Source: {event_1.get('Source')}, DetailType: {event_1.get('DetailType')}, EventBusName: {event_1.get('EventBusName', 'default (omitted)')}")
         logger.info(f"DEBUG: Event 2 structure - Source: {event_2.get('Source')}, DetailType: {event_2.get('DetailType')}, EventBusName: {event_2.get('EventBusName', 'default (omitted)')}")
-        logger.info(f"DEBUG: Expected rule patterns - Rule 1: source=['lambda'], detail-type=['AlbanyHealthGarminHealthMetricsWorkflow']")
-        logger.info(f"DEBUG: Expected rule patterns - Rule 2: source=['lambda'], detail-type=['AlbanyHealthGarminBBIWorkflow']")
+        logger.info(f"DEBUG: Expected rule patterns - Rule 1: source=['lambda'], detail-type=['{garmin_detail_type}']")
+        logger.info(f"DEBUG: Expected rule patterns - Rule 2: source=['lambda'], detail-type=['{bbi_detail_type}']")
         
         response = eventbridge_client.put_events(Entries=events_to_send)
         
@@ -779,8 +784,8 @@ def trigger_batch_complete_events(eventbridge_client, bucket_name: str, batch_in
             logger.error(f"Failed entries: {response.get('Entries', [])}")
         else:
             logger.info(f"Successfully sent 2 different events to EventBridge for batch {batch_folder}")
-            logger.info(f"Event 1: Targeting rule '{completion_rule_name}' with source='lambda', detail-type='AlbanyHealthGarminHealthMetricsWorkflow'")
-            logger.info(f"Event 2: Targeting rule '{processing_rule_name}' with source='lambda', detail-type='AlbanyHealthGarminBBIWorkflow'")
+            logger.info(f"Event 1: Targeting rule '{completion_rule_name}' with source='lambda', detail-type='{garmin_detail_type}'")
+            logger.info(f"Event 2: Targeting rule '{processing_rule_name}' with source='lambda', detail-type='{bbi_detail_type}'")
             logger.info(f"DEBUG: Check EventBridge console to verify rules are ENABLED and matching these events")
         
         return {
@@ -795,7 +800,7 @@ def trigger_batch_complete_events(eventbridge_client, bucket_name: str, batch_in
                 {
                     'event_number': 1,
                     'source': 'lambda',
-                    'detail_type': 'AlbanyHealthGarminHealthMetricsWorkflow',
+                    'detail_type': garmin_detail_type,
                     'batch_id': batch_folder,
                     'purpose': 'Completion notification',
                     'target_rule': completion_rule_name
@@ -803,7 +808,7 @@ def trigger_batch_complete_events(eventbridge_client, bucket_name: str, batch_in
                 {
                     'event_number': 2,
                     'source': 'lambda', 
-                    'detail_type': 'AlbanyHealthGarminBBIWorkflow',
+                    'detail_type': bbi_detail_type,
                     'batch_id': batch_folder,
                     'purpose': 'Processing trigger',
                     'target_rule': processing_rule_name

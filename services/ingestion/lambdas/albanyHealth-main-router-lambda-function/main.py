@@ -17,11 +17,12 @@ def extract_folder_name(object_key):
 def get_queue_url_for_folder(folder_name):
     """
     Returns the appropriate SQS queue URL based on folder name
+    Uses environment variables that are set by CDK (environment-agnostic)
     """
     queue_mapping = {
-        'garmin-device-heart-rate': os.environ.get('HEALTH_HEART_RATE_QUEUE_DEV'),
-        'garmin-connect-sleep-stage': os.environ.get('HEALTH_SLEEP_QUEUE_DEV'),
-        'garmin-device-step': os.environ.get('HEALTH_STEP_QUEUE_DEV')
+        'garmin-device-heart-rate': os.environ.get('HEALTH_HEART_RATE_QUEUE'),
+        'garmin-connect-sleep-stage': os.environ.get('HEALTH_SLEEP_QUEUE'),
+        'garmin-device-step': os.environ.get('HEALTH_STEP_QUEUE')
     }
     
     # List of folders that should use the default queue
@@ -37,7 +38,7 @@ def get_queue_url_for_folder(folder_name):
     # Use default queue only for specific folders
     if not queue_url and folder_name in default_queue_folders:
         print(f"Using default queue for folder {folder_name}")
-        queue_url = os.environ.get('HEALTH_OTHERS_QUEUE_DEV')
+        queue_url = os.environ.get('HEALTH_OTHERS_QUEUE')
     
     return queue_url
 

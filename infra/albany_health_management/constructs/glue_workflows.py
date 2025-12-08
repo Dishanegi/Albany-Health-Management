@@ -4,22 +4,30 @@ from aws_cdk import (
     custom_resources as cr,
 )
 from constructs import Construct
+from ..config import EnvironmentConfig
 
 class GlueWorkflows(Construct):
-    def __init__(self, scope: Construct, construct_id: str, glue_jobs, activate_garmin_triggers_lambda, activate_bbi_triggers_lambda, **kwargs) -> None:
+    def __init__(self, scope: Construct, construct_id: str, glue_jobs, activate_garmin_triggers_lambda, activate_bbi_triggers_lambda, environment: EnvironmentConfig = None, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
+        
+        # Default to dev environment if not provided
+        if environment is None:
+            from ..config import get_environment
+            environment = get_environment("dev")
+        
+        env_suffix = environment.name.lower()
 
-        # Create Glue workflows
+        # Create Glue workflows with environment-specific naming
         garmin_workflow = glue.CfnWorkflow(
             self,
             "AlbanyHealthGarminHealthMetricsWorkflow",
-            name="AlbanyHealthGarminHealthMetricsWorkflow",
+            name=f"AlbanyHealthGarminHealthMetricsWorkflow-{env_suffix}",
         )
 
         bbi_workflow = glue.CfnWorkflow(
             self,
             "AlbanyHealthGarminBBIWorkflow",
-            name="AlbanyHealthGarminBBIWorkflow",
+            name=f"AlbanyHealthGarminBBIWorkflow-{env_suffix}",
         )
 
         # Expose workflows to other constructs (e.g., EventBridge rules)
@@ -27,10 +35,11 @@ class GlueWorkflows(Construct):
         self.bbi_workflow = bbi_workflow
 
         # Define the job order for the Garmin Health Metrics workflow
+        # Job names must match the actual Glue job names (with environment suffix)
         garmin_job_order = [
-            "AlbanyHealthGarmin-Data-Preprocessor-Glue-Job",
-            "AlbanyHealthGarmin-Data-Merge-Glue-Job",
-            "AlbanyHealthGarmin-Data-Delete-Glue-Job",
+            f"AlbanyHealthGarmin-Data-Preprocessor-Glue-Job-{env_suffix}",
+            f"AlbanyHealthGarmin-Data-Merge-Glue-Job-{env_suffix}",
+            f"AlbanyHealthGarmin-Data-Delete-Glue-Job-{env_suffix}",
         ]
 
         # Event-based trigger to allow EventBridge to start the Garmin workflow
@@ -38,7 +47,7 @@ class GlueWorkflows(Construct):
         # This is the starting trigger for the workflow (only one starting trigger allowed)
         garmin_event_trigger = glue.CfnTrigger(
             self,
-            "GarminEventTrigger",
+            f"GarminEventTrigger-{env_suffix.capitalize()}",
             type="EVENT",
             workflow_name=garmin_workflow.name,
             actions=[
@@ -66,7 +75,7 @@ class GlueWorkflows(Construct):
             # This is what the trigger waits for before starting next_job
             conditional_trigger = glue.CfnTrigger(
                 self,
-                f"GarminTrigger{i}",
+                f"GarminTrigger{i}-{env_suffix.capitalize()}",
                 type="CONDITIONAL",
                 workflow_name=garmin_workflow.name,  # Must match workflow name exactly
                 actions=[glue.CfnTrigger.ActionProperty(job_name=next_job.name)],
@@ -97,7 +106,7 @@ class GlueWorkflows(Construct):
         # Create custom resource provider to activate triggers after deployment
         activate_garmin_provider = cr.Provider(
             self,
-            "ActivateGarminTriggersProvider",
+            f"ActivateGarminTriggersProvider-{env_suffix.capitalize()}",
             on_event_handler=activate_garmin_triggers_lambda,
         )
         
@@ -105,7 +114,7 @@ class GlueWorkflows(Construct):
         # Using CfnCustomResource (L1 construct) with the provider's service token
         activate_garmin_resource = cfn.CfnCustomResource(
             self,
-            "ActivateGarminTriggersResource",
+            f"ActivateGarminTriggersResource-{env_suffix.capitalize()}",
             service_token=activate_garmin_provider.service_token,
         )
         
@@ -114,10 +123,11 @@ class GlueWorkflows(Construct):
             activate_garmin_resource.add_dependency(trigger)
 
         # Define the job order for the BBI workflow
+        # Job names must match the actual Glue job names (with environment suffix)
         bbi_job_order = [
-            "AlbanyHealthGarmin-BBI-Preprocessor-Glue-Job",
-            "AlbanyHealthGarmin-BBI-Merge-Data-Glue-Job",
-            "AlbanyHealthGarmin-BBI-Delete-Data-Glue-Job",
+            f"AlbanyHealthGarmin-BBI-Preprocessor-Glue-Job-{env_suffix}",
+            f"AlbanyHealthGarmin-BBI-Merge-Data-Glue-Job-{env_suffix}",
+            f"AlbanyHealthGarmin-BBI-Delete-Data-Glue-Job-{env_suffix}",
         ]
 
         # Event-based trigger to allow EventBridge to start the BBI workflow
@@ -125,7 +135,7 @@ class GlueWorkflows(Construct):
         # This is the starting trigger for the workflow (only one starting trigger allowed)
         bbi_event_trigger = glue.CfnTrigger(
             self,
-            "BBIEventTrigger",
+            f"BBIEventTrigger-{env_suffix.capitalize()}",
             type="EVENT",
             workflow_name=bbi_workflow.name,
             actions=[
@@ -153,7 +163,7 @@ class GlueWorkflows(Construct):
             # This is what the trigger waits for before starting next_job
             conditional_trigger = glue.CfnTrigger(
                 self,
-                f"BBITrigger{i}",
+                f"BBITrigger{i}-{env_suffix.capitalize()}",
                 type="CONDITIONAL",
                 workflow_name=bbi_workflow.name,  # Must match workflow name exactly
                 actions=[glue.CfnTrigger.ActionProperty(job_name=next_job.name)],
@@ -184,7 +194,7 @@ class GlueWorkflows(Construct):
         # Create custom resource to activate triggers after all conditional triggers are created
         activate_bbi_provider = cr.Provider(
             self,
-            "ActivateBBITriggersProvider",
+            f"ActivateBBITriggersProvider-{env_suffix.capitalize()}",
             on_event_handler=activate_bbi_triggers_lambda,
         )
         
@@ -192,7 +202,7 @@ class GlueWorkflows(Construct):
         # Using CfnCustomResource (L1 construct) with the provider's service token
         activate_bbi_resource = cfn.CfnCustomResource(
             self,
-            "ActivateBBITriggersResource",
+            f"ActivateBBITriggersResource-{env_suffix.capitalize()}",
             service_token=activate_bbi_provider.service_token,
         )
         

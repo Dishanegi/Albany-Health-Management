@@ -1,5 +1,7 @@
 # Albany Health Management Platform
 
+> **🆕 Multi-Environment Support**: This platform now supports deploying to multiple environments (dev, sandbox, uat, qe, staging, prod) with complete resource isolation. All resources are automatically named with environment-specific suffixes. See [Deployment Section](#deploying-the-system) for details.
+
 ## 📋 What This System Does
 
 This platform automatically processes health data from Garmin devices. When new health data files arrive, the system:
@@ -138,6 +140,21 @@ New Health Data Files Arrive
 
 ### Deploying the System
 
+#### Multi-Environment Support
+
+This system supports deploying to multiple environments. All resources are automatically named with environment-specific suffixes to ensure complete isolation between environments.
+
+**Available Environments:**
+- `dev` - Development environment (default)
+- `sandbox` - Sandbox environment for testing
+- `sandox` - Sandox environment
+- `uat` - User Acceptance Testing environment
+- `qe` - Quality Engineering environment
+- `staging` - Staging environment
+- `prod` - Production environment
+
+#### Deployment Steps
+
 1. **First-time setup** (only needed once per AWS account/region):
    ```bash
    cdk bootstrap
@@ -145,25 +162,79 @@ New Health Data Files Arrive
 
 2. **Preview changes** (see what will be created/updated):
    ```bash  
-   cdk diff
+   cdk diff --context env=dev
    ```
 
-3. **Deploy the system**:
+3. **Deploy to a specific environment**:
    ```bash
-   cdk deploy  
+   # Deploy to development (default)
+   cdk deploy
+   # or explicitly:
+   cdk deploy --context env=dev
+   
+   # Deploy to staging
+   cdk deploy --context env=staging
+   
+   # Deploy to production
+   cdk deploy --context env=prod
+   
+   # Deploy to UAT
+   cdk deploy --context env=uat
    ```
 
-4. **Remove the system** (when you want to delete everything):
+4. **Deploy with specific AWS account and region**:
    ```bash
-   cdk destroy
+   cdk deploy --context env=staging --context account=123456789012 --context region=us-west-2
    ```
+
+5. **Remove the system** (when you want to delete everything):
+   ```bash
+   cdk destroy --context env=dev
+   ```
+
+#### Environment-Specific Resource Naming
+
+All resources are automatically named with the environment suffix to ensure complete isolation:
+
+- **S3 Buckets**: `albanyhealthsource-s3bucket-{env}`, `albanyhealthprocessed-s3bucket-{env}`, etc.
+- **Lambda Functions**: `albanyHealth-main-router-lambda-function-{env}`, etc.
+- **SQS Queues**: `AlbanyHealthMain-SQSQueue-{ENV}`, `AlbanyHealthMain-DLQ-{ENV}`, etc.
+- **Glue Jobs**: `AlbanyHealthGarmin-Data-Preprocessor-Glue-Job-{env}`, etc.
+- **Glue Workflows**: `AlbanyHealthGarminHealthMetricsWorkflow-{env}`, etc.
+- **EventBridge Rules**: `trigger-merge-patient-health-metrics-{env}`, etc.
+- **IAM Roles**: `AlbanyHealthGlueJobRole-{env}`, `AlbanyHealthS3ToSQSRole-{env}`, etc.
+- **Stack Name**: `AlbanyHealthManagementStack-{env}`
+
+#### Resource Tags
+
+All resources are automatically tagged with:
+- `Environment`: The environment name (dev/sandbox/uat/qe/staging/prod)
+- `Project`: AlbanyHealthManagement
+
+This allows you to:
+- Filter resources by environment in AWS Console
+- Apply environment-specific policies
+- Track costs per environment
+- Deploy multiple environments in the same AWS account
+
+> **Note**: For detailed deployment instructions and troubleshooting, see `infra/DEPLOYMENT.md`
 
 ### Development Commands
 
-- `cdk synth` - Generate the deployment template (without deploying)
+- `cdk synth --context env=dev` - Generate the deployment template for a specific environment
 - `cdk ls` - List all stacks in the project
-- `cdk watch` - Automatically redeploy when code changes
+- `cdk diff --context env=dev` - Preview changes before deploying
+- `cdk watch --context env=dev` - Automatically redeploy when code changes
 - `pytest tests` - Run automated tests
+
+### Environment Configuration
+
+Environment configurations are managed in `infra/albany_health_management/config.py`. Each environment can have:
+- Custom AWS account and region settings
+- Environment-specific resource configurations
+- Custom feature flags or settings
+
+To add a new environment or modify existing ones, edit the `ENVIRONMENTS` dictionary in `config.py`.
 
 ---
 
@@ -175,7 +246,9 @@ Albany-Health-Management/
 ├── 📂 infra/                         # Infrastructure code (how the system is built)
 │   ├── app.py                        # Main application entry point
 │   ├── cdk.json                      # CDK configuration
+│   ├── DEPLOYMENT.md                 # Multi-environment deployment guide
 │   └── albany_health_management/     
+│       ├── config.py                 # Environment configuration
 │       ├── albany_health_management_stack.py  # Main system definition
 │       └── constructs/               # Individual components
 │           ├── s3_buckets.py         # Storage bucket definitions 
@@ -214,36 +287,52 @@ Albany-Health-Management/
 ### Where to Check System Status
 
 1. **AWS CloudWatch Console**: 
-   - View logs from all Lambda functions
+   - View logs from all Lambda functions (log groups are environment-specific)
    - See error messages if something goes wrong
    - Monitor system performance
+   - Filter by environment using tags
 
 2. **AWS Glue Console**:
-   - Check if data processing jobs are running
+   - Check if data processing jobs are running (jobs are named with environment suffix)
    - See job execution history  
    - View job success/failure status
+   - Workflows are named: `AlbanyHealthGarminHealthMetricsWorkflow-{env}`
 
 3. **AWS S3 Console**:
-   - Verify files are arriving in the source bucket
+   - Verify files are arriving in the source bucket (buckets are environment-specific)
    - Check if processed files are being created
-   - Monitor storage usage 
+   - Monitor storage usage
+   - Bucket names: `albanyhealthsource-s3bucket-{env}`, etc.
+
+4. **AWS CloudFormation Console**:
+   - View stack status: `AlbanyHealthManagementStack-{env}`
+   - Check resource creation status
+   - View stack events and errors 
 
 ### Common Issues
 
 **Problem**: Files are not being processed
-- **Check**: Are files arriving in the source S3 bucket? 
-- **Check**: Are there any error messages in CloudWatch logs?
-- **Check**: Are the SQS queues empty or backed up?
+- **Check**: Are files arriving in the correct environment's source S3 bucket? (e.g., `albanyhealthsource-s3bucket-{env}`)
+- **Check**: Are there any error messages in CloudWatch logs for the specific environment?
+- **Check**: Are the SQS queues empty or backed up? (Queue names include environment: `AlbanyHealthMain-SQSQueue-{ENV}`)
+- **Check**: Are you looking at the correct environment's resources?
 
 **Problem**: Data processing jobs are failing
-- **Check**: CloudWatch logs for the specific Glue job
+- **Check**: CloudWatch logs for the specific Glue job (jobs are named with environment suffix)
 - **Check**: Are there permission errors? 
 - **Check**: Is the data format correct?
+- **Check**: Verify you're checking the correct environment's Glue jobs
 
 **Problem**: System is slow
-- **Check**: How many files are waiting in SQS queues? 
-- **Check**: Are the Lambda functions running?
+- **Check**: How many files are waiting in SQS queues? (Use environment-specific queue names)
+- **Check**: Are the Lambda functions running? (Function names include environment suffix)
 - **Check**: Are there any error messages?
+- **Check**: Verify you're monitoring the correct environment
+
+**Problem**: Deployment fails with "ResourceExistenceCheck Failed"
+- **Check**: S3 bucket names are globally unique - ensure bucket names don't already exist
+- **Check**: Verify account and region are correctly configured
+- **Check**: See `infra/DEPLOYMENT.md` for detailed troubleshooting steps
 
 ---
 
@@ -254,7 +343,18 @@ Albany-Health-Management/
 - **Lambda Capacity**: 10 concurrent executions per function (for faster processing) 
 - **Glue Worker Type**: G.1X (4 vCPU, 16 GB memory per worker)
 - **Permissions**: Least privilege IAM roles (for security best practices)
-- **Log Retention**: 14 days (logs are kept for 2 weeks)
+- **Log Retention**: 
+  - Lambda function logs: Automatically managed by CDK (environment-specific log groups)
+  - Explicit log groups: 7 days retention
+  - All logs are environment-specific and isolated
+
+### Multi-Environment Architecture
+
+- **Complete Resource Isolation**: Each environment has its own set of resources with unique names
+- **Environment-Specific Naming**: All resources include the environment suffix
+- **Automatic Tagging**: All resources are tagged with environment and project name
+- **Stack Isolation**: Each environment deploys as a separate CloudFormation stack
+- **IAM Role Isolation**: Each environment has its own IAM roles for security
 
 ### Data Processing Requirements
 
@@ -283,10 +383,15 @@ If you encounter issues or have questions:
 
 ## 🔐 Security Notes
 
-- The system has full admin access for maximum flexibility
-- All data is stored securely in AWS S3 buckets
-- Access is controlled through AWS IAM roles
-- Logs are retained for 7 days for troubleshooting
+- **Environment Isolation**: Each environment has separate IAM roles and resources
+- **IAM Roles**: Environment-specific roles (e.g., `AlbanyHealthGlueJobRole-{env}`)
+- **Data Storage**: All data is stored securely in AWS S3 buckets with environment-specific names
+- **Access Control**: Access is controlled through AWS IAM roles per environment
+- **Log Retention**: 
+  - Lambda logs: Automatically managed, environment-specific
+  - Explicit log groups: 7 days retention
+- **Resource Tagging**: All resources are tagged for security and compliance tracking
+- **Multi-Account Support**: Can deploy different environments to different AWS accounts for enhanced security
 
 
 ---

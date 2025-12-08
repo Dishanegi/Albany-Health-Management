@@ -13,16 +13,24 @@ from .constructs.lambda_functions import LambdaFunctions
 from .constructs.glue_jobs import GlueJobs
 from .constructs.glue_workflows import GlueWorkflows
 from .constructs.eventbridge_rules import EventBridgeRules
+from .config import EnvironmentConfig
 
 class AlbanyHealthManagementStack(Stack):
-    def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
+    def __init__(self, scope: Construct, construct_id: str, env_config: EnvironmentConfig = None, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
+        
+        # Default to dev environment if not provided
+        if env_config is None:
+            from .config import get_environment
+            env_config = get_environment("dev")
+        
+        env_suffix = env_config.name.lower()
 
         # Create S3 buckets
-        s3_buckets = S3Buckets(self, "S3Buckets")
+        s3_buckets = S3Buckets(self, "S3Buckets", environment=env_config)
 
         # Create SQS queues
-        sqs_queues = SQSQueues(self, "SQSQueues")
+        sqs_queues = SQSQueues(self, "SQSQueues", environment=env_config)
 
         # Create Lambda functions
         lambda_functions = LambdaFunctions(
@@ -36,11 +44,12 @@ class AlbanyHealthManagementStack(Stack):
             sqs_queues.processing_files_queue,
             s3_buckets.source_bucket,
             s3_buckets.processed_bucket,
+            environment=env_config,
         )
         
 
         # Create Glue jobs with S3 bucket access
-        glue_jobs = GlueJobs(self, "GlueJobs", s3_buckets=s3_buckets)
+        glue_jobs = GlueJobs(self, "GlueJobs", s3_buckets=s3_buckets, environment=env_config)
 
         # Create Glue workflows
         glue_workflows = GlueWorkflows(
@@ -49,6 +58,7 @@ class AlbanyHealthManagementStack(Stack):
             glue_jobs.glue_jobs,
             lambda_functions.activate_garmin_triggers_lambda,
             lambda_functions.activate_bbi_triggers_lambda,
+            environment=env_config,
         )
 
         # Create EventBridge rules
@@ -57,8 +67,9 @@ class AlbanyHealthManagementStack(Stack):
             "EventBridgeRules",
             lambda_functions.data_inactivity_checker_function,
             glue_workflows,
+            environment=env_config,
         )        
-        # Add EventBridge rule names as environment variables to the data inactivity checker Lambda
+        # Add EventBridge rule names and detail-types as environment variables to the data inactivity checker Lambda
         lambda_functions.data_inactivity_checker_function.add_environment(
             "EVENTBRIDGE_COMPLETION_RULE_NAME", 
             event_bridge_rules.completion_rule_name
@@ -70,6 +81,14 @@ class AlbanyHealthManagementStack(Stack):
         lambda_functions.data_inactivity_checker_function.add_environment(
             "EVENTBRIDGE_BUS_NAME", 
             "default"
+        )
+        lambda_functions.data_inactivity_checker_function.add_environment(
+            "EVENTBRIDGE_GARMIN_DETAIL_TYPE",
+            event_bridge_rules.garmin_detail_type
+        )
+        lambda_functions.data_inactivity_checker_function.add_environment(
+            "EVENTBRIDGE_BBI_DETAIL_TYPE",
+            event_bridge_rules.bbi_detail_type
         )
         
         # Add expected file count environment variables (configurable, defaults to 7)
@@ -95,10 +114,11 @@ class AlbanyHealthManagementStack(Stack):
             "7"
         )
 
-        # Create an IAM role for S3 to send messages to SQS
+        # Create an IAM role for S3 to send messages to SQS with environment-specific naming
         s3_to_sqs_role = iam.Role(
             self,
-            "S3ToSQSRole",
+            f"S3ToSQSRole-{env_suffix.capitalize()}",
+            role_name=f"AlbanyHealthS3ToSQSRole-{env_suffix}",
             assumed_by=iam.ServicePrincipal("s3.amazonaws.com"),
         )
 

@@ -5,15 +5,25 @@ from aws_cdk import (
     aws_s3_assets as s3_assets,
 )
 from constructs import Construct
+from ..config import EnvironmentConfig
 
 class GlueJobs(Construct):
-    def __init__(self, scope: Construct, construct_id: str, s3_buckets=None, **kwargs) -> None:
+    def __init__(self, scope: Construct, construct_id: str, s3_buckets=None, environment: EnvironmentConfig = None, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
+        
+        # Default to dev environment if not provided
+        if environment is None:
+            from ..config import get_environment
+            environment = get_environment("dev")
+        
+        self.environment = environment
+        env_suffix = environment.name.lower()
 
-        # Create an IAM role for the Glue jobs
+        # Create an IAM role for the Glue jobs with environment-specific naming
         glue_job_role = iam.Role(
             self,
-            "GlueJobRole",
+            f"GlueJobRole-{env_suffix.capitalize()}",
+            role_name=f"AlbanyHealthGlueJobRole-{env_suffix}",
             assumed_by=iam.ServicePrincipal("glue.amazonaws.com"),
         )
         
@@ -110,26 +120,29 @@ class GlueJobs(Construct):
         # Define the script names and paths
         glue_scripts_base_path = "../services/analytics/glue_jobs"
 
+        # Job names with environment suffix and their corresponding script paths
         script_names_and_paths = [
-            ("AlbanyHealthGarmin-Data-Preprocessor-Glue-Job", f"{glue_scripts_base_path}/AlbanyHealth-Garmin-Health-metrics-Flow-Script/Garmin-Data-preprocessing-script.py"),
-            ("AlbanyHealthGarmin-Data-Merge-Glue-Job", f"{glue_scripts_base_path}/AlbanyHealth-Garmin-Health-metrics-Flow-Script/Garmin-Data-merge-script.py"),
-            ("AlbanyHealthGarmin-Data-Delete-Glue-Job", f"{glue_scripts_base_path}/AlbanyHealth-Garmin-Health-metrics-Flow-Script/Garmin-Data-delete-script.py"),
-            ("AlbanyHealthGarmin-BBI-Preprocessor-Glue-Job", f"{glue_scripts_base_path}/AlbanyHealth-BBI-Flow-Script/BBI-preprocessing-data-script.py"),
-            ("AlbanyHealthGarmin-BBI-Merge-Data-Glue-Job", f"{glue_scripts_base_path}/AlbanyHealth-BBI-Flow-Script/BBI-merge-data-script.py"),
-            ("AlbanyHealthGarmin-BBI-Delete-Data-Glue-Job", f"{glue_scripts_base_path}/AlbanyHealth-BBI-Flow-Script/BBI-delete-data-script.py"),
+            (f"AlbanyHealthGarmin-Data-Preprocessor-Glue-Job-{env_suffix}", f"{glue_scripts_base_path}/AlbanyHealth-Garmin-Health-metrics-Flow-Script/Garmin-Data-preprocessing-script.py"),
+            (f"AlbanyHealthGarmin-Data-Merge-Glue-Job-{env_suffix}", f"{glue_scripts_base_path}/AlbanyHealth-Garmin-Health-metrics-Flow-Script/Garmin-Data-merge-script.py"),
+            (f"AlbanyHealthGarmin-Data-Delete-Glue-Job-{env_suffix}", f"{glue_scripts_base_path}/AlbanyHealth-Garmin-Health-metrics-Flow-Script/Garmin-Data-delete-script.py"),
+            (f"AlbanyHealthGarmin-BBI-Preprocessor-Glue-Job-{env_suffix}", f"{glue_scripts_base_path}/AlbanyHealth-BBI-Flow-Script/BBI-preprocessing-data-script.py"),
+            (f"AlbanyHealthGarmin-BBI-Merge-Data-Glue-Job-{env_suffix}", f"{glue_scripts_base_path}/AlbanyHealth-BBI-Flow-Script/BBI-merge-data-script.py"),
+            (f"AlbanyHealthGarmin-BBI-Delete-Data-Glue-Job-{env_suffix}", f"{glue_scripts_base_path}/AlbanyHealth-BBI-Flow-Script/BBI-delete-data-script.py"),
         ]
 
-        # Upload the ETL scripts to S3 using assets
+        # Upload the ETL scripts to S3 using assets with environment-specific naming
         script_assets = {
-            name: s3_assets.Asset(self, f"{name}Asset", path=path)
+            name: s3_assets.Asset(self, f"{name}Asset-{env_suffix.capitalize()}", path=path)
             for name, path in script_names_and_paths
         }
 
         # Define default arguments for each Glue job with bucket names from environment variables
         # Only set defaults if s3_buckets are provided
+        # Use base job names (without env suffix) for lookup, then map to full job names
         job_default_arguments = {}
         if s3_buckets:
-            job_default_arguments = {
+            # Map base job names to their default arguments
+            base_job_args = {
                 "AlbanyHealthGarmin-Data-Preprocessor-Glue-Job": {
                     "--SOURCE_BUCKET": s3_buckets.processed_bucket.bucket_name,
                     "--TARGET_BUCKET": s3_buckets.merged_bucket.bucket_name,
@@ -153,6 +166,11 @@ class GlueJobs(Construct):
                     "--BUCKET_NAME": s3_buckets.bbi_processing_bucket.bucket_name,
                 },
             }
+            
+            # Map full job names (with env suffix) to their arguments
+            for base_name, args in base_job_args.items():
+                full_name = f"{base_name}-{env_suffix}"
+                job_default_arguments[full_name] = args
 
         # Create Glue jobs using the L2 construct
         self.glue_jobs = {}
@@ -178,6 +196,6 @@ class GlueJobs(Construct):
             
             self.glue_jobs[name] = glue.CfnJob(
                 self,
-                f"{name}Job",
+                f"{name}Job-{env_suffix.capitalize()}",
                 **job_props
             )

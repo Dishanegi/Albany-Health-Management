@@ -3,10 +3,18 @@ from aws_cdk import (
     Duration,
 )
 from constructs import Construct
+from ..config import EnvironmentConfig
 
 class SQSQueues(Construct):
-    def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
+    def __init__(self, scope: Construct, construct_id: str, environment: EnvironmentConfig = None, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
+        
+        # Default to dev environment if not provided
+        if environment is None:
+            from ..config import get_environment
+            environment = get_environment("dev")
+        
+        env_suffix = environment.name.upper()
 
         # Lambda functions have a timeout of 300 seconds (5 minutes)
         # AWS requires SQS visibility timeout to be at least equal to Lambda timeout
@@ -23,43 +31,43 @@ class SQSQueues(Construct):
         # These catch messages that fail repeatedly to prevent infinite retries
         main_dlq = sqs.Queue(
             self,
-            "AlbanyHealthMain-DLQ-DEV",
-            queue_name="AlbanyHealthMain-DLQ-DEV",
+            f"AlbanyHealthMain-DLQ-{env_suffix}",
+            queue_name=f"AlbanyHealthMain-DLQ-{env_suffix}",
             retention_period=Duration.days(14),  # Keep failed messages for 14 days for debugging
         )
         
         sleep_dlq = sqs.Queue(
             self,
-            "AlbanyHealthSleep-DLQ-DEV",
-            queue_name="AlbanyHealthSleep-DLQ-DEV",
+            f"AlbanyHealthSleep-DLQ-{env_suffix}",
+            queue_name=f"AlbanyHealthSleep-DLQ-{env_suffix}",
             retention_period=Duration.days(14),
         )
         
         step_dlq = sqs.Queue(
             self,
-            "AlbanyHealthStep-DLQ-DEV",
-            queue_name="AlbanyHealthStep-DLQ-DEV",
+            f"AlbanyHealthStep-DLQ-{env_suffix}",
+            queue_name=f"AlbanyHealthStep-DLQ-{env_suffix}",
             retention_period=Duration.days(14),
         )
         
         others_dlq = sqs.Queue(
             self,
-            "AlbanyHealthOthers-DLQ-DEV",
-            queue_name="AlbanyHealthOthers-DLQ-DEV",
+            f"AlbanyHealthOthers-DLQ-{env_suffix}",
+            queue_name=f"AlbanyHealthOthers-DLQ-{env_suffix}",
             retention_period=Duration.days(14),
         )
         
         heart_rate_dlq = sqs.Queue(
             self,
-            "AlbanyHealthHeartRate-DLQ-DEV",
-            queue_name="AlbanyHealthHeartRate-DLQ-DEV",
+            f"AlbanyHealthHeartRate-DLQ-{env_suffix}",
+            queue_name=f"AlbanyHealthHeartRate-DLQ-{env_suffix}",
             retention_period=Duration.days(14),
         )
         
         processing_files_dlq = sqs.Queue(
             self,
-            "AlbanyHealthSuccessfullProcessingFiles-DLQ-DEV",
-            queue_name="AlbanyHealthSuccessfullProcessingFiles-DLQ-DEV",
+            f"AlbanyHealthSuccessfullProcessingFiles-DLQ-{env_suffix}",
+            queue_name=f"AlbanyHealthSuccessfullProcessingFiles-DLQ-{env_suffix}",
             retention_period=Duration.days(14),
         )
 
@@ -71,16 +79,16 @@ class SQSQueues(Construct):
 
         self.main_queue = sqs.Queue(
             self,
-            "AlbanyHealthMain-SQSQueue-DEV",
-            queue_name="AlbanyHealthMain-SQSQueue-DEV",
+            f"AlbanyHealthMain-SQSQueue-{env_suffix}",
+            queue_name=f"AlbanyHealthMain-SQSQueue-{env_suffix}",
             visibility_timeout=visibility_timeout,
             dead_letter_queue=dead_letter_queue,
         )
 
         self.sleep_queue = sqs.Queue(
             self,
-            "AlbanyHealthSleep-SQSQueue-DEV",
-            queue_name="AlbanyHealthSleep-SQSQueue-DEV",
+            f"AlbanyHealthSleep-SQSQueue-{env_suffix}",
+            queue_name=f"AlbanyHealthSleep-SQSQueue-{env_suffix}",
             visibility_timeout=visibility_timeout,
             dead_letter_queue=sqs.DeadLetterQueue(
                 max_receive_count=max_receive_count,
@@ -90,8 +98,8 @@ class SQSQueues(Construct):
 
         self.step_queue = sqs.Queue(
             self,
-            "AlbanyHealthStep-SQSQueue-DEV",
-            queue_name="AlbanyHealthStep-SQSQueue-DEV",
+            f"AlbanyHealthStep-SQSQueue-{env_suffix}",
+            queue_name=f"AlbanyHealthStep-SQSQueue-{env_suffix}",
             visibility_timeout=visibility_timeout,
             dead_letter_queue=sqs.DeadLetterQueue(
                 max_receive_count=max_receive_count,
@@ -101,8 +109,8 @@ class SQSQueues(Construct):
 
         self.others_queue = sqs.Queue(
             self,
-            "AlbanyHealthOthers-SQSQueue-DEV",
-            queue_name="AlbanyHealthOthers-SQSQueue-DEV",
+            f"AlbanyHealthOthers-SQSQueue-{env_suffix}",
+            queue_name=f"AlbanyHealthOthers-SQSQueue-{env_suffix}",
             visibility_timeout=visibility_timeout,
             dead_letter_queue=sqs.DeadLetterQueue(
                 max_receive_count=max_receive_count,
@@ -112,8 +120,8 @@ class SQSQueues(Construct):
 
         self.heart_rate_queue = sqs.Queue(
             self,
-            "AlbanyHealthHeartRate-SQSQueue-DEV",
-            queue_name="AlbanyHealthHeartRate-SQSQueue-DEV",
+            f"AlbanyHealthHeartRate-SQSQueue-{env_suffix}",
+            queue_name=f"AlbanyHealthHeartRate-SQSQueue-{env_suffix}",
             visibility_timeout=visibility_timeout,
             dead_letter_queue=sqs.DeadLetterQueue(
                 max_receive_count=max_receive_count,
@@ -123,8 +131,8 @@ class SQSQueues(Construct):
 
         self.processing_files_queue = sqs.Queue(
             self,
-            "AlbanyHealthSuccessfullProcessingFiles-SQSQueue-DEV",
-            queue_name="AlbanyHealthSuccessfullProcessingFiles-SQSQueue-DEV",
+            f"AlbanyHealthSuccessfullProcessingFiles-SQSQueue-{env_suffix}",
+            queue_name=f"AlbanyHealthSuccessfullProcessingFiles-SQSQueue-{env_suffix}",
             visibility_timeout=visibility_timeout,
             dead_letter_queue=sqs.DeadLetterQueue(
                 max_receive_count=max_receive_count,

@@ -3,15 +3,14 @@ from aws_cdk import (
     RemovalPolicy,
     aws_iam as iam,
     aws_logs as logs,
-    Duration
+    Duration,
+    Stack,
 )
 from constructs import Construct
+from ..config import EnvironmentConfig
 
 # Define the AWS-provided account ID for Lambda layers
 AWS_LAYER_ACCOUNT_ID = "336392948345"
-
-# Define the AWS region
-AWS_REGION = "us-east-1"
 
 # Define the AWS-provided pandas layer 
 PANDAS_LAYER = "AWSSDKPandas-Python313"
@@ -24,35 +23,46 @@ class LambdaFunctions(Construct):
                  main_queue, heart_rate_queue, others_queue, 
                  sleep_queue, step_queue,
                  processing_files_queue,source_bucket, 
-                 processed_bucket, **kwargs) -> None:
+                 processed_bucket, environment: EnvironmentConfig = None, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
+        
+        # Default to dev environment if not provided
+        if environment is None:
+            from ..config import get_environment
+            environment = get_environment("dev")
+        
+        env_suffix = environment.name.lower()
+        
+        # Get AWS region from stack
+        stack = Stack.of(self)
+        aws_region = stack.region or "us-east-1"
 
         # Define the Pandas layer ARN using the account ID and region
-        pandas_layer_arn = f"arn:aws:lambda:{AWS_REGION}:{AWS_LAYER_ACCOUNT_ID}:layer:{PANDAS_LAYER}:{PANDAS_LAYER_VERSION}"
+        pandas_layer_arn = f"arn:aws:lambda:{aws_region}:{AWS_LAYER_ACCOUNT_ID}:layer:{PANDAS_LAYER}:{PANDAS_LAYER_VERSION}"
 
         services_base_path = "../services/ingestion/lambdas"
 
         self.main_router_function = lambda_.Function(
             self,
-            "AlbanyHealthMainRouterLambdaFunctionDev",
-            function_name="albanyHealth-main-router-lambda-function-dev",
+            f"AlbanyHealthMainRouterLambdaFunction{env_suffix.capitalize()}",
+            function_name=f"albanyHealth-main-router-lambda-function-{env_suffix}",
             runtime=lambda_.Runtime.PYTHON_3_13,
             handler="main.lambda_handler",
             code=lambda_.Code.from_asset(f"{services_base_path}/albanyHealth-main-router-lambda-function"),
             timeout=Duration.seconds(300),  # 5 minutes
             memory_size=256,  # 256 MB - lightweight routing function
             environment={
-                "HEALTH_HEART_RATE_QUEUE_DEV": heart_rate_queue.queue_url,
-                "HEALTH_SLEEP_QUEUE_DEV": sleep_queue.queue_url,
-                "HEALTH_STEP_QUEUE_DEV": step_queue.queue_url,
-                "HEALTH_OTHERS_QUEUE_DEV": others_queue.queue_url,
+                "HEALTH_HEART_RATE_QUEUE": heart_rate_queue.queue_url,
+                "HEALTH_SLEEP_QUEUE": sleep_queue.queue_url,
+                "HEALTH_STEP_QUEUE": step_queue.queue_url,
+                "HEALTH_OTHERS_QUEUE": others_queue.queue_url,
             }
         )
 
         self.heart_rate_function = lambda_.Function(
             self,
-            "AlbanyHealthHeartRateLambdaFunctionDev",
-            function_name="albanyHealth-heart-rate-lambda-function-dev",
+            f"AlbanyHealthHeartRateLambdaFunction{env_suffix.capitalize()}",
+            function_name=f"albanyHealth-heart-rate-lambda-function-{env_suffix}",
             runtime=lambda_.Runtime.PYTHON_3_13,
             handler="main.lambda_handler",
             code=lambda_.Code.from_asset(f"{services_base_path}/albanyHealth-heart-rate-lambda-function"),
@@ -60,7 +70,7 @@ class LambdaFunctions(Construct):
             memory_size=1024,  # 1024 MB - more memory for faster pandas processing
             layers=[lambda_.LayerVersion.from_layer_version_arn(
                 self,
-                "HeartRatePandasLayer",
+                f"HeartRatePandasLayer-{env_suffix.capitalize()}",
                 pandas_layer_arn
             )],
             environment={
@@ -70,8 +80,8 @@ class LambdaFunctions(Construct):
 
         self.step_function = lambda_.Function(
             self,
-            "AlbanyHealthStepLambdaFunctionDev",
-            function_name="albanyHealth-step-lambda-function-dev",
+            f"AlbanyHealthStepLambdaFunction{env_suffix.capitalize()}",
+            function_name=f"albanyHealth-step-lambda-function-{env_suffix}",
             runtime=lambda_.Runtime.PYTHON_3_13,
             handler="main.lambda_handler",
             code=lambda_.Code.from_asset(f"{services_base_path}/albanyHealth-step-lambda-function"),
@@ -79,7 +89,7 @@ class LambdaFunctions(Construct):
             memory_size=1024,  # 1024 MB - more memory for faster pandas processing
             layers=[lambda_.LayerVersion.from_layer_version_arn(
                 self,
-                "StepsPandasLayer",
+                f"StepsPandasLayer-{env_suffix.capitalize()}",
                 pandas_layer_arn
             )],
             environment={
@@ -89,8 +99,8 @@ class LambdaFunctions(Construct):
 
         self.sleep_function = lambda_.Function(
             self,
-            "AlbanyHealthSleepLambdaFunctionDev",
-            function_name="albanyHealth-sleep-lambda-function-dev",
+            f"AlbanyHealthSleepLambdaFunction{env_suffix.capitalize()}",
+            function_name=f"albanyHealth-sleep-lambda-function-{env_suffix}",
             runtime=lambda_.Runtime.PYTHON_3_13,
             handler="main.lambda_handler",
             code=lambda_.Code.from_asset(f"{services_base_path}/albanyHealth-sleep-lambda-function"),
@@ -98,7 +108,7 @@ class LambdaFunctions(Construct):
             memory_size=1024,  # 1024 MB - more memory for faster pandas processing
             layers=[lambda_.LayerVersion.from_layer_version_arn(
                 self,
-                "SleepPandasLayer",
+                f"SleepPandasLayer-{env_suffix.capitalize()}",
                 pandas_layer_arn
             )],
             environment={
@@ -108,8 +118,8 @@ class LambdaFunctions(Construct):
 
         self.other_metrics_function = lambda_.Function(
             self,
-            "AlbanyHealthOtherMetricsLambdaFunctionDev",
-            function_name="albanyHealth-other-metrics-lambda-function-dev",
+            f"AlbanyHealthOtherMetricsLambdaFunction{env_suffix.capitalize()}",
+            function_name=f"albanyHealth-other-metrics-lambda-function-{env_suffix}",
             runtime=lambda_.Runtime.PYTHON_3_13,
             handler="main.lambda_handler",
             code=lambda_.Code.from_asset(f"{services_base_path}/albanyHealth-other-metrics-lambda-function"),
@@ -117,7 +127,7 @@ class LambdaFunctions(Construct):
             memory_size=1024,  # 1024 MB - more memory for faster pandas processing
             layers=[lambda_.LayerVersion.from_layer_version_arn(
                 self,
-                "OtherMetricsPandasLayer",
+                f"OtherMetricsPandasLayer-{env_suffix.capitalize()}",
                 pandas_layer_arn
             )],
             environment={
@@ -127,8 +137,8 @@ class LambdaFunctions(Construct):
 
         self.data_inactivity_checker_function = lambda_.Function(
             self,
-            "AlbanyHealthDataInactivityCheckerLambdaFunctionDev",
-            function_name="albanyHealth-data-inactivity-checker-lambda-function-dev",
+            f"AlbanyHealthDataInactivityCheckerLambdaFunction{env_suffix.capitalize()}",
+            function_name=f"albanyHealth-data-inactivity-checker-lambda-function-{env_suffix}",
             runtime=lambda_.Runtime.PYTHON_3_13,
             handler="main.lambda_handler",
             code=lambda_.Code.from_asset(f"{services_base_path}/albanyHealth-data-inactivity-checker-lambda-function"),
@@ -196,8 +206,8 @@ class LambdaFunctions(Construct):
         # Explicitly create log group with DESTROY removal policy to ensure it's deleted on stack destroy
         activate_garmin_log_group = logs.LogGroup(
             self,
-            "ActivateGarminTriggersLogGroup",
-            log_group_name=f"/aws/lambda/albanyHealth-activate-garmin-triggers-lambda-function-dev",
+            f"ActivateGarminTriggersLogGroup-{env_suffix.capitalize()}",
+            log_group_name=f"/aws/lambda/albanyHealth-activate-garmin-triggers-lambda-function-{env_suffix}",
             retention=logs.RetentionDays.ONE_WEEK,
             removal_policy=RemovalPolicy.DESTROY,
         )
@@ -205,12 +215,16 @@ class LambdaFunctions(Construct):
         self.activate_garmin_triggers_lambda = lambda_.Function(
             self,
             "ActivateGarminTriggersLambda",
-            function_name="albanyHealth-activate-garmin-triggers-lambda-function-dev",
+            function_name=f"albanyHealth-activate-garmin-triggers-lambda-function-{env_suffix}",
             runtime=lambda_.Runtime.PYTHON_3_11,
             handler="main.handler",
             timeout=Duration.seconds(60),
             code=lambda_.Code.from_asset(f"{services_base_path}/albanyHealth-activate-garmin-triggers-lambda-function"),
             log_group=activate_garmin_log_group,
+            environment={
+                "WORKFLOW_NAME": f"AlbanyHealthGarminHealthMetricsWorkflow-{env_suffix}",
+                "ENVIRONMENT": env_suffix,
+            },
         )
         
         # Grant permissions to activate triggers
@@ -229,8 +243,8 @@ class LambdaFunctions(Construct):
         # Explicitly create log group with DESTROY removal policy to ensure it's deleted on stack destroy
         activate_bbi_log_group = logs.LogGroup(
             self,
-            "ActivateBBITriggersLogGroup",
-            log_group_name=f"/aws/lambda/albanyHealth-activate-bbi-triggers-lambda-function-dev",
+            f"ActivateBBITriggersLogGroup-{env_suffix.capitalize()}",
+            log_group_name=f"/aws/lambda/albanyHealth-activate-bbi-triggers-lambda-function-{env_suffix}",
             retention=logs.RetentionDays.ONE_WEEK,
             removal_policy=RemovalPolicy.DESTROY,
         )
@@ -238,12 +252,16 @@ class LambdaFunctions(Construct):
         self.activate_bbi_triggers_lambda = lambda_.Function(
             self,
             "ActivateBBITriggersLambda",
-            function_name="albanyHealth-activate-bbi-triggers-lambda-function-dev",
+            function_name=f"albanyHealth-activate-bbi-triggers-lambda-function-{env_suffix}",
             runtime=lambda_.Runtime.PYTHON_3_11,
             handler="main.handler",
             timeout=Duration.seconds(60),
             code=lambda_.Code.from_asset(f"{services_base_path}/albanyHealth-activate-bbi-triggers-lambda-function"),
             log_group=activate_bbi_log_group,
+            environment={
+                "WORKFLOW_NAME": f"AlbanyHealthGarminBBIWorkflow-{env_suffix}",
+                "ENVIRONMENT": env_suffix,
+            },
         )
         
         # Grant permissions to activate triggers
