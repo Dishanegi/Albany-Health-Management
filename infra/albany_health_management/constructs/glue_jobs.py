@@ -1,3 +1,5 @@
+import os
+from pathlib import Path
 from aws_cdk import (
     Stack,
     aws_glue as glue,
@@ -63,6 +65,7 @@ class GlueJobs(Construct):
                 iam.PolicyStatement(
                     actions=["s3:DeleteObject"],
                     resources=[
+                        s3_buckets.source_bucket.arn_for_objects("*"),  # For deleting source folders
                         s3_buckets.processed_bucket.arn_for_objects("*"),
                         s3_buckets.bbi_processing_bucket.arn_for_objects("*"),
                         s3_buckets.merged_bucket.arn_for_objects("*"),
@@ -118,7 +121,12 @@ class GlueJobs(Construct):
         )
 
         # Define the script names and paths
-        glue_scripts_base_path = "../services/analytics/glue_jobs"
+        # Get absolute path to services directory (relative to project root)
+        # This file is in: infra/albany_health_management/constructs/glue_jobs.py
+        # Project root is: infra/../ (two levels up)
+        current_file = Path(__file__).resolve()
+        project_root = current_file.parent.parent.parent.parent
+        glue_scripts_base_path = str(project_root / "services" / "analytics" / "glue_jobs")
 
         # Job names with environment suffix and their corresponding script paths
         script_names_and_paths = [
@@ -128,6 +136,7 @@ class GlueJobs(Construct):
             (f"AlbanyHealthGarmin-BBI-Preprocessor-Glue-Job-{env_suffix}", f"{glue_scripts_base_path}/AlbanyHealth-BBI-Flow-Script/BBI-preprocessing-data-script.py"),
             (f"AlbanyHealthGarmin-BBI-Merge-Data-Glue-Job-{env_suffix}", f"{glue_scripts_base_path}/AlbanyHealth-BBI-Flow-Script/BBI-merge-data-script.py"),
             (f"AlbanyHealthGarmin-BBI-Delete-Data-Glue-Job-{env_suffix}", f"{glue_scripts_base_path}/AlbanyHealth-BBI-Flow-Script/BBI-delete-data-script.py"),
+            (f"AlbanyHealthGarmin-BBI-Delete-Source-Folders-Glue-Job-{env_suffix}", f"{glue_scripts_base_path}/AlbanyHealth-BBI-Flow-Script/BBI-delete-source-folders-script.py"),
         ]
 
         # Upload the ETL scripts to S3 using assets with environment-specific naming
@@ -165,6 +174,9 @@ class GlueJobs(Construct):
                 "AlbanyHealthGarmin-BBI-Delete-Data-Glue-Job": {
                     "--BUCKET_NAME": s3_buckets.bbi_processing_bucket.bucket_name,
                 },
+                "AlbanyHealthGarmin-BBI-Delete-Source-Folders-Glue-Job": {
+                    "--SOURCE_BUCKET": s3_buckets.source_bucket.bucket_name,
+                },
             }
             
             # Map full job names (with env suffix) to their arguments
@@ -173,18 +185,20 @@ class GlueJobs(Construct):
                 job_default_arguments[full_name] = args
 
         # Create Glue jobs using the L2 construct
+        # All jobs run as glueetl (PySpark) with identical configuration and access
         self.glue_jobs = {}
         for name, asset in script_assets.items():
+            # All jobs are configured as glueetl (PySpark) jobs with identical settings
             job_props = {
                 "name": name,
                 "command": glue.CfnJob.JobCommandProperty(
-                    name="glueetl",
+                    name="glueetl",  # All jobs run as PySpark (glueetl)
                     script_location=asset.s3_object_url,
                     python_version="3",
                 ),
-                "role": glue_job_role.role_arn,
-                "glue_version": "5.0",
-                # Configure worker type and number of workers
+                "role": glue_job_role.role_arn,  # Same IAM role for all jobs
+                "glue_version": "5.0",  # Same Glue version for all jobs
+                # Configure worker type and number of workers (required for glueetl)
                 # Using G.1X worker type (4 vCPU, 16 GB memory) with 10 workers
                 "worker_type": "G.1X",
                 "number_of_workers": 10,
@@ -194,6 +208,7 @@ class GlueJobs(Construct):
             if s3_buckets and name in job_default_arguments:
                 job_props["default_arguments"] = job_default_arguments[name]
             
+            # Create the Glue job with identical configuration for all jobs
             self.glue_jobs[name] = glue.CfnJob(
                 self,
                 f"{name}Job-{env_suffix.capitalize()}",

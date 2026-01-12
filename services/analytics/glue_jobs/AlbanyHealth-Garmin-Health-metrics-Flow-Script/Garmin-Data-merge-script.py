@@ -487,15 +487,19 @@ try:
                 if part_file:
                     target_key = f"{output_folder.replace(f's3://{target_bucket_name}/', '')}/{output_filename}"
                     
-                    # Handle filename collision by appending timestamp
+                    # Delete existing file if it exists in the final merged bucket
                     try:
                         s3_client.head_object(Bucket=target_bucket_name, Key=target_key)
-                        current_time = datetime.datetime.now().strftime("%H%M%S")
-                        output_filename = f"merged_file_{date_str}_{current_time}.csv"
-                        target_key = f"{output_folder.replace(f's3://{target_bucket_name}/', '')}/{output_filename}"
-                        log_info(f"File already exists, using new name: {output_filename}")
-                    except:
-                        pass
+                        log_info(f"File already exists at {target_key}, deleting it before writing new merged file")
+                        s3_client.delete_object(Bucket=target_bucket_name, Key=target_key)
+                        log_info(f"Successfully deleted existing file: {target_key}")
+                    except Exception as e:
+                        # If file doesn't exist (NoSuchKey) or any other error, log and continue
+                        error_code = getattr(e, 'response', {}).get('Error', {}).get('Code', '')
+                        if error_code == 'NoSuchKey' or '404' in str(e) or 'not found' in str(e).lower():
+                            log_info(f"No existing file found at {target_key}, proceeding with new file")
+                        else:
+                            log_info(f"Note: Could not check/delete existing file: {str(e)}, proceeding anyway")
                     
                     # Copy from processing bucket to merged bucket
                     s3_client.copy_object(

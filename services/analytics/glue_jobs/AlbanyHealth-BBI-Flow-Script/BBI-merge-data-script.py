@@ -544,30 +544,78 @@ try:
             # TRANSFORM THE ISODATE COLUMN AFTER MERGE
             merged_df = transform_isodate_column(merged_df)
             
-            # Get the latest ISO date for filename
+            # Get the latest ISO date for filename and convert to YYYYMMDD format
             latest_iso_date = get_latest_iso_date(merged_df)
             
-            # Write the merged file with new naming convention
-            merged_output_file = f"{merged_output_dir}merged_{latest_iso_date}.csv"
+            # Convert date format from YYYY-MM-DD to YYYYMMDD (matching Garmin script)
+            if latest_iso_date:
+                date_str = latest_iso_date.replace("-", "")
+            else:
+                date_str = datetime.datetime.now().strftime("%Y%m%d")
             
-            # Convert to pandas and write locally
-            merged_pandas_df = merged_df.toPandas()
-            local_merged_file = f"/tmp/merged_{latest_iso_date}_{int(time.time())}.csv"  # Add timestamp to avoid conflicts
-            merged_pandas_df.to_csv(local_merged_file, index=False)
+            log_info(f"Using date for filename: {date_str}")
             
-            # Upload to S3
-            s3_client.upload_file(
-                local_merged_file, 
-                destination_bucket_name, 
-                merged_output_file
-            )
+            # Determine output filename (matching Garmin script pattern)
+            output_filename = f"merged_file_{date_str}.csv"
             
-            # Clean up local file
-            if os.path.exists(local_merged_file):
-                os.remove(local_merged_file)
+            # Create target key for final location
+            target_key = f"{merged_output_dir}{output_filename}"
+            
+            # Write to temp folder in source bucket first, then copy to destination bucket (matching Garmin script)
+            # Use folder_path as identifier for temp folder
+            folder_identifier = folder_path.replace("/", "_") if folder_path else "root"
+            temp_folder = f"s3://{source_bucket_name}/temp_merged_data_{folder_identifier}_{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}"
+            
+            # Coalesce to single partition for single output file
+            single_partition_df = merged_df.coalesce(1)
+            
+            log_info(f"Writing merged data to temporary location in source bucket: {temp_folder}")
+            single_partition_df.write.option("header", "true").option("quote", '"').option(
+                "sep", ","
+            ).mode("overwrite").csv(temp_folder)
+            
+            # Find the generated part file and copy to final location
+            temp_key_prefix = temp_folder.replace(f"s3://{source_bucket_name}/", "")
+            response = s3_client.list_objects_v2(Bucket=source_bucket_name, Prefix=temp_key_prefix)
+            
+            part_file = None
+            if "Contents" in response:
+                for obj in response["Contents"]:
+                    if obj["Key"].endswith(".csv") and "part-" in obj["Key"]:
+                        part_file = obj["Key"]
+                        break
+            
+            if part_file:
+                # Delete existing file if it exists in the final merged bucket
+                try:
+                    s3_client.head_object(Bucket=destination_bucket_name, Key=target_key)
+                    log_info(f"File already exists at {target_key}, deleting it before writing new merged file")
+                    s3_client.delete_object(Bucket=destination_bucket_name, Key=target_key)
+                    log_info(f"Successfully deleted existing file: {target_key}")
+                except Exception as e:
+                    # If file doesn't exist (NoSuchKey) or any other error, log and continue
+                    error_code = getattr(e, 'response', {}).get('Error', {}).get('Code', '')
+                    if error_code == 'NoSuchKey' or '404' in str(e) or 'not found' in str(e).lower():
+                        log_info(f"No existing file found at {target_key}, proceeding with new file")
+                    else:
+                        log_info(f"Note: Could not check/delete existing file: {str(e)}, proceeding anyway")
                 
-            log_info(f"Successfully created merged file: {merged_output_file}")
-            merged_count += 1
+                # Copy from source bucket to destination bucket
+                s3_client.copy_object(
+                    Bucket=destination_bucket_name,
+                    CopySource={"Bucket": source_bucket_name, "Key": part_file},
+                    Key=target_key
+                )
+                
+                # Clean up temp files from source bucket
+                for obj in response["Contents"]:
+                    s3_client.delete_object(Bucket=source_bucket_name, Key=obj["Key"])
+                
+                log_info(f"Successfully saved merged data for folder {folder_path} as {output_filename}")
+                log_info(f"Total records for folder {folder_path}: {merged_df.count()}")
+                merged_count += 1
+            else:
+                log_error(f"Could not find temporary part file for folder {folder_path}")
             
         except Exception as e:
             log_error(f"Error merging files for folder {folder_path}: {str(e)}")

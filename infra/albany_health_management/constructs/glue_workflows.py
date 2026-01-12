@@ -42,6 +42,10 @@ class GlueWorkflows(Construct):
             f"AlbanyHealthGarmin-Data-Delete-Glue-Job-{env_suffix}",
         ]
 
+        # Ensure all jobs exist before creating triggers
+        # Add dependencies to ensure jobs are created before workflow references them
+        all_garmin_jobs = [glue_jobs[job_name] for job_name in garmin_job_order]
+        
         # Event-based trigger to allow EventBridge to start the Garmin workflow
         # EVENT triggers fire when EventBridge calls glue:NotifyEvent
         # This is the starting trigger for the workflow (only one starting trigger allowed)
@@ -56,6 +60,10 @@ class GlueWorkflows(Construct):
                 )
             ],
         )
+        
+        # Ensure event trigger waits for all jobs to be created
+        for job in all_garmin_jobs:
+            garmin_event_trigger.add_dependency(job)
 
         # Create triggers to align the jobs in the Garmin Health Metrics workflow
         # CONDITIONAL triggers wait for the previous job to succeed before starting the next job
@@ -90,6 +98,11 @@ class GlueWorkflows(Construct):
                     logical="ANY",  # Changed from "AND" - though with single condition, both work the same
                 ),
             )
+            
+            # Ensure trigger waits for both jobs to be created
+            conditional_trigger.add_dependency(current_job)
+            conditional_trigger.add_dependency(next_job)
+            
             garmin_conditional_triggers.append(conditional_trigger)
             
             # Ensure conditional triggers are properly chained within the workflow
@@ -128,8 +141,13 @@ class GlueWorkflows(Construct):
             f"AlbanyHealthGarmin-BBI-Preprocessor-Glue-Job-{env_suffix}",
             f"AlbanyHealthGarmin-BBI-Merge-Data-Glue-Job-{env_suffix}",
             f"AlbanyHealthGarmin-BBI-Delete-Data-Glue-Job-{env_suffix}",
+            f"AlbanyHealthGarmin-BBI-Delete-Source-Folders-Glue-Job-{env_suffix}",
         ]
 
+        # Ensure all jobs exist before creating triggers
+        # Add dependencies to ensure jobs are created before workflow references them
+        all_bbi_jobs = [glue_jobs[job_name] for job_name in bbi_job_order]
+        
         # Event-based trigger to allow EventBridge to start the BBI workflow
         # EVENT triggers fire when EventBridge calls glue:NotifyEvent
         # This is the starting trigger for the workflow (only one starting trigger allowed)
@@ -144,6 +162,10 @@ class GlueWorkflows(Construct):
                 )
             ],
         )
+        
+        # Ensure event trigger waits for all jobs to be created
+        for job in all_bbi_jobs:
+            bbi_event_trigger.add_dependency(job)
 
         # Create triggers to align the jobs in the BBI workflow
         # CONDITIONAL triggers wait for the previous job to succeed before starting the next job
@@ -178,6 +200,11 @@ class GlueWorkflows(Construct):
                     logical="ANY",  # Changed from "AND" - though with single condition, both work the same
                 ),
             )
+            
+            # Ensure trigger waits for both jobs to be created
+            conditional_trigger.add_dependency(current_job)
+            conditional_trigger.add_dependency(next_job)
+            
             bbi_conditional_triggers.append(conditional_trigger)
             
             # Ensure conditional triggers are properly chained within the workflow

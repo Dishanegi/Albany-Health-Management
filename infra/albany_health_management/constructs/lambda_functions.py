@@ -1,3 +1,5 @@
+import os
+from pathlib import Path
 from aws_cdk import (
     aws_lambda as lambda_,
     RemovalPolicy,
@@ -40,7 +42,12 @@ class LambdaFunctions(Construct):
         # Define the Pandas layer ARN using the account ID and region
         pandas_layer_arn = f"arn:aws:lambda:{aws_region}:{AWS_LAYER_ACCOUNT_ID}:layer:{PANDAS_LAYER}:{PANDAS_LAYER_VERSION}"
 
-        services_base_path = "../services/ingestion/lambdas"
+        # Get absolute path to services directory (relative to project root)
+        # This file is in: infra/albany_health_management/constructs/lambda_functions.py
+        # Project root is: infra/../ (two levels up)
+        current_file = Path(__file__).resolve()
+        project_root = current_file.parent.parent.parent.parent
+        services_base_path = str(project_root / "services" / "ingestion" / "lambdas")
 
         self.main_router_function = lambda_.Function(
             self,

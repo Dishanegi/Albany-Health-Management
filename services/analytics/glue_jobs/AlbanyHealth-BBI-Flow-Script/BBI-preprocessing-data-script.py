@@ -5,8 +5,9 @@ import re
 import time
 import os
 from pyspark.context import SparkContext
-from pyspark.sql.functions import lit, col, when, pow, lag
+from pyspark.sql.functions import lit, col, when, pow, lag, from_unixtime, to_timestamp, date_format
 from pyspark.sql.window import Window
+from pyspark.sql.types import StringType
 from awsglue.transforms import *
 from awsglue.utils import getResolvedOptions
 from awsglue.context import GlueContext
@@ -308,11 +309,53 @@ try:
                     
                     # Remove first row where BBI is null (can't calculate difference)
                     df = df.filter(col("bbi").isNotNull())
+                    
+                    # Validate BBI values are reasonable (normal heartbeat: 200-2000 ms)
+                    # Log statistics before filtering
+                    total_bbi_count = df.count()
+                    if total_bbi_count > 0:
+                        # Count unreasonable values for logging
+                        unreasonable_bbi = df.filter((col("bbi") < 200) | (col("bbi") > 2000))
+                        unreasonable_count = unreasonable_bbi.count()
+                        
+                        if unreasonable_count > 0:
+                            log_info(f"WARNING: Found {unreasonable_count} BBI values outside normal range (200-2000 ms)")
+                            # Sample some unreasonable values for debugging
+                            sample_unreasonable = unreasonable_bbi.select("unixTimestampInMs", "bbi").limit(5).collect()
+                            for row in sample_unreasonable:
+                                log_info(f"  Sample: unixTimestampInMs={row['unixTimestampInMs']}, bbi={row['bbi']} ms")
+                            
+                            # Filter out unreasonable BBI values (set to NULL or remove)
+                            # Option: Keep but flag, or remove entirely
+                            # For now, we'll keep them but log the warning
+                            # You can change this to filter them out if needed:
+                            # df = df.filter((col("bbi") >= 200) & (col("bbi") <= 2000))
+                        else:
+                            log_info(f"All {total_bbi_count} BBI values are within normal range (200-2000 ms)")
                 
                 # Add BBI difference calculations
                 if "bbi" in df.columns:
                     # Ensure bbi is numeric
                     df = df.withColumn("bbi", col("bbi").cast("double"))
+                    
+                    # Validate unixTimestampInMs is reasonable (should be in milliseconds since epoch)
+                    # Check if timestamps are in reasonable range (year 2000 to 2100)
+                    # 2000-01-01 00:00:00 UTC = 946684800000 ms
+                    # 2100-01-01 00:00:00 UTC = 4102444800000 ms
+                    min_timestamp = 946684800000  # Year 2000
+                    max_timestamp = 4102444800000  # Year 2100
+                    
+                    invalid_timestamps = df.filter(
+                        (col("unixTimestampInMs") < min_timestamp) | 
+                        (col("unixTimestampInMs") > max_timestamp)
+                    )
+                    invalid_count = invalid_timestamps.count()
+                    
+                    if invalid_count > 0:
+                        log_error(f"WARNING: Found {invalid_count} timestamps outside reasonable range (2000-2100)")
+                        log_error("This may indicate timezone conversion issues or incorrect timestamp format")
+                    else:
+                        log_info(f"All timestamps validated - within reasonable range (2000-2100)")
                     
                     # Define a window specification for calculations
                     window_spec = Window.partitionBy("participant_id").orderBy("unixTimestampInMs")
@@ -321,7 +364,7 @@ try:
                     # Note: lag with negative offset is equivalent to lead with positive offset
                     df = df.withColumn("next_bbi", lag("bbi", -1).over(window_spec))
                     
-                    # Calculate bbi_diff as the absolute difference between current and next
+                    # Calculate bbi_diff as the difference between current and next
                     df = df.withColumn("bbi_diff", 
                                      when(col("next_bbi").isNull(), lit(0.0))
                                      .otherwise(col("bbi") - col("next_bbi")))
@@ -331,6 +374,27 @@ try:
                     
                     # Remove the temporary column
                     df = df.drop("next_bbi")
+                    
+                    # Log summary statistics for validation
+                    if df.count() > 0:
+                        # Sample statistics
+                        bbi_stats = df.select(
+                            col("bbi").alias("bbi_val"),
+                            col("bbi_diff").alias("bbi_diff_val")
+                        ).filter(col("bbi").isNotNull())
+                        
+                        if bbi_stats.count() > 0:
+                            # Get min/max for validation
+                            bbi_min = bbi_stats.agg({"bbi_val": "min"}).collect()[0][0]
+                            bbi_max = bbi_stats.agg({"bbi_val": "max"}).collect()[0][0]
+                            bbi_avg = bbi_stats.agg({"bbi_val": "avg"}).collect()[0][0]
+                            
+                            log_info(f"BBI Statistics - Min: {bbi_min:.2f} ms, Max: {bbi_max:.2f} ms, Avg: {bbi_avg:.2f} ms")
+                            
+                            # Validate average is reasonable
+                            if bbi_avg < 200 or bbi_avg > 2000:
+                                log_error(f"WARNING: Average BBI ({bbi_avg:.2f} ms) is outside normal range (200-2000 ms)")
+                                log_error("This may indicate timestamp calculation issues or missing data points")
                 else:
                     log_info(f"Warning: 'bbi' column not found in {file_path}, skipping BBI calculations")
                 
