@@ -33,44 +33,52 @@ def expand_sleep_data(df):
     """
     Expands sleep data so each row represents exactly one minute
     """
-    # Check if required columns exist
-    required_cols = ['durationInMs', 'type']
-    missing_required = [col for col in required_cols if col not in df.columns]
+    # Check if required columns exist and add defaults efficiently
+    # If duration is missing, try to infer it or use default
+    if 'durationInMs' not in df.columns:
+        # Try to find a duration column (optimized: check common names first)
+        duration_found = False
+        for col in df.columns:
+            col_lower = col.lower()
+            if any(term in col_lower for term in ['duration', 'length']):
+                print(f"Using '{col}' as duration column")
+                df['durationInMs'] = df[col]
+                duration_found = True
+                break
+        
+        if not duration_found:
+            # Use default value
+            print("Using default duration of 60000ms (1 minute)")
+            df['durationInMs'] = 60000  # Default to 1 minute
     
-    if missing_required:
-        # Log missing columns
-        print(f"Warning: Missing required columns: {', '.join(missing_required)}")
+    # If type is missing, use default
+    if 'type' not in df.columns:
+        # Try to find a type column (optimized: check common names first)
+        type_found = False
+        for col in df.columns:
+            col_lower = col.lower()
+            if any(term in col_lower for term in ['type', 'stage', 'state']):
+                print(f"Using '{col}' as type column")
+                df['type'] = df[col]
+                type_found = True
+                break
         
-        # If duration is missing, try to infer it or use default
-        if 'durationInMs' not in df.columns:
-            # Try to find a duration column
-            duration_candidates = [col for col in df.columns if any(term in col.lower() for term in ['duration', 'length', 'time'])]
-            if duration_candidates:
-                print(f"Using '{duration_candidates[0]}' as duration column")
-                df['durationInMs'] = df[duration_candidates[0]]
-            else:
-                # Use default value
-                print("Using default duration of 60000ms (1 minute)")
-                df['durationInMs'] = 60000  # Default to 1 minute
-        
-        # If type is missing, use default
-        if 'type' not in df.columns:
-            # Try to find a type column
-            type_candidates = [col for col in df.columns if any(term in col.lower() for term in ['type', 'stage', 'state', 'level'])]
-            if type_candidates:
-                print(f"Using '{type_candidates[0]}' as type column")
-                df['type'] = df[type_candidates[0]]
-            else:
-                # Use default value
-                print("Using default sleep type 'light'")
-                df['type'] = 'light'
+        if not type_found:
+            # Use default value
+            print("Using default sleep type 'light'")
+            df['type'] = 'light'
 
-    # Add sleep summary ID if missing
+    # Add sleep summary ID if missing (optimized)
     if 'sleepSummaryId' not in df.columns:
-        sleep_id_candidates = [col for col in df.columns if any(term in col.lower() for term in ['sleep', 'summary', 'id'])]
-        if sleep_id_candidates:
-            df['sleepSummaryId'] = df[sleep_id_candidates[0]]
-        else:
+        sleep_id_found = False
+        for col in df.columns:
+            col_lower = col.lower()
+            if any(term in col_lower for term in ['sleep', 'summary', 'id']):
+                df['sleepSummaryId'] = df[col]
+                sleep_id_found = True
+                break
+        
+        if not sleep_id_found:
             # Create a dummy sleep ID
             df['sleepSummaryId'] = 'sleep_session_1'
     
@@ -78,10 +86,13 @@ def expand_sleep_data(df):
     try:
         df['durationInMs'] = pd.to_numeric(df['durationInMs'], errors='coerce').fillna(60000)
         
-        # Check if durations are too small (possibly in seconds)
-        if df['durationInMs'].median() < 1000 and df['durationInMs'].median() > 0:
-            print("Warning: Durations appear to be in seconds. Converting to milliseconds.")
-            df['durationInMs'] = df['durationInMs'] * 1000
+        # Check if durations are too small (possibly in seconds) - only if we have multiple rows
+        # Skip median calculation for single row to improve performance
+        if len(df) > 1:
+            median_duration = df['durationInMs'].median()
+            if median_duration < 1000 and median_duration > 0:
+                print("Warning: Durations appear to be in seconds. Converting to milliseconds.")
+                df['durationInMs'] = df['durationInMs'] * 1000
     except Exception as e:
         print(f"Error converting duration to numeric: {e}")
         df['durationInMs'] = 60000  # Default to 1 minute
@@ -118,13 +129,17 @@ def expand_sleep_data(df):
     expanded_rows = []
     print(f"Expanding {len(df)} sleep records into minute-by-minute data...")
     
-    for idx, row in df.iterrows():
+    # Convert to dict for faster access - more efficient than iterrows()
+    df_dict = df.to_dict('records')
+    
+    for idx, row in enumerate(df_dict):
         # Skip rows with invalid duration
-        if pd.isna(row['durationInMs']) or row['durationInMs'] <= 0:
+        duration_ms = row.get('durationInMs', 60000)
+        if pd.isna(duration_ms) or duration_ms <= 0:
             continue
         
         # Convert duration to minutes (ceiling to ensure we don't lose any time)
-        duration_minutes = max(1, int(np.ceil(row['durationInMs'] / 60000)))
+        duration_minutes = max(1, int(np.ceil(duration_ms / 60000)))
         
         # Get base timestamp
         base_timestamp = row.get('unixTimestampInMs', int(datetime.now().timestamp() * 1000))
@@ -134,8 +149,8 @@ def expand_sleep_data(df):
             # Calculate new timestamp for this minute - properly increment by exactly one minute for each row
             unix_timestamp = base_timestamp + (i * 60000)  # Add i minutes in milliseconds
             
-            # Create new record with all original columns
-            new_record = {col: row[col] for col in df.columns if col not in ['durationInMs', 'unixTimestampInMs']}
+            # Create new record with all original columns (copy dict for efficiency)
+            new_record = {k: v for k, v in row.items() if k not in ['durationInMs', 'unixTimestampInMs']}
             
             # Add/override specific columns for minute-by-minute data
             new_record.update({

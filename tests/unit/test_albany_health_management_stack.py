@@ -1,3 +1,12 @@
+import sys
+import os
+
+# Add infra directory to path for CDK imports
+infra_path = os.path.join(os.path.dirname(__file__), '..', '..', 'infra')
+infra_path = os.path.abspath(infra_path)
+if infra_path not in sys.path:
+    sys.path.insert(0, infra_path)
+
 import aws_cdk as core
 import aws_cdk.assertions as assertions
 
