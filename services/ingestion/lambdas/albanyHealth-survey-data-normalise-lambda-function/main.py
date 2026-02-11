@@ -1,10 +1,9 @@
-import json
 import os
 import io
 import re
 import csv
 import logging
-from typing import Tuple, Dict, List, Optional
+from typing import Tuple
 
 import boto3
 import pandas as pd
@@ -13,17 +12,8 @@ import pandas as pd
 s3 = boto3.client("s3")
 
 # ---------- Config ----------
-# Match your working SQS pattern: destination bucket comes from env
-DESTINATION_BUCKET = os.environ.get("DESTINATION_BUCKET")
-if not DESTINATION_BUCKET:
-    raise RuntimeError("Missing required env var DESTINATION_BUCKET")
-
-# Optional: folder prefix in destination bucket
+OUTPUT_BUCKET = os.environ.get("OUTPUT_BUCKET")          # optional; default = same as input bucket
 OUTPUT_PREFIX = os.environ.get("OUTPUT_PREFIX", "normalized/")
-
-# Optional: if you want to keep same key path, set OUTPUT_PREFIX="" and it'll write to same key
-# Optional: only process if object_key starts with this prefix
-INPUT_PREFIX = os.environ.get("INPUT_PREFIX")
 
 # Match Labfront answer columns like "1_1", "1_2", ...
 ANSWER_COL_RE = re.compile(r"^\d+_\d+$")
@@ -50,7 +40,7 @@ def _decode_bytes(b: bytes) -> str:
         try:
             return b.decode(enc)
         except UnicodeDecodeError:
-            continue
+            pass
     raise ValueError("Unable to decode input file")
 
 
@@ -58,9 +48,6 @@ def _read_meta(lines) -> dict:
     """
     Find meta table starting with 'projectId,...' and parse the next row safely.
     Uses Python csv.reader (robust to odd quoting when parsing a single line).
-
-    NOTE: This still assumes the meta row is on ONE physical line.
-    If your meta has embedded newlines in quoted fields, switch to the full-file csv.reader approach.
     """
     for i, ln in enumerate(lines):
         if ln.strip().startswith("projectId"):
@@ -82,6 +69,13 @@ def _read_meta(lines) -> dict:
 
 
 def _read_key_table(lines) -> Tuple[pd.DataFrame, int]:
+    """
+    Reads the key table between:
+      sectionIndex,... (header)
+    and
+      timezone,... (data header)
+    Returns (key_df, data_start_line_index).
+    """
     key_start = None
     data_start = None
 
@@ -100,6 +94,7 @@ def _read_key_table(lines) -> Tuple[pd.DataFrame, int]:
 
     key_csv = "\n".join([l for l in lines[key_start:data_start] if l.strip() != ""])
 
+    # Python engine is more tolerant of odd quotes/commas in long text fields
     key_df = pd.read_csv(
         io.StringIO(key_csv),
         dtype=str,
@@ -112,6 +107,9 @@ def _read_key_table(lines) -> Tuple[pd.DataFrame, int]:
 
 
 def _read_data_table(lines, data_start: int) -> pd.DataFrame:
+    """
+    Reads the responses table starting at 'timezone,...' until EOF.
+    """
     data_csv = "\n".join([l for l in lines[data_start:] if l.strip() != ""])
 
     data_df = pd.read_csv(
@@ -128,7 +126,6 @@ def _read_data_table(lines, data_start: int) -> pd.DataFrame:
 def _normalize_with_pandas(raw_text: str) -> pd.DataFrame:
     """
     Convert Labfront export from wide format to normalized long format (AFTER).
-    Transformation logic remains the same.
     """
     lines = raw_text.splitlines()
 
@@ -141,6 +138,7 @@ def _normalize_with_pandas(raw_text: str) -> pd.DataFrame:
     data_df = _read_data_table(lines, data_start)
 
     # ---- Decide which column contains question text ----
+    # Labfront exports vary: questionDescription vs questionDescript vs questionName
     if "questionDescription" in key_df.columns:
         qtext_col = "questionDescription"
     elif "questionDescript" in key_df.columns:
@@ -176,7 +174,8 @@ def _normalize_with_pandas(raw_text: str) -> pd.DataFrame:
             .melt(id_vars=["section_index", "question_index"], var_name="opt_col", value_name="answer_text")
         )
         opt_long["answer_code"] = (
-            opt_long["opt_col"].str.extract(r"option(\d)Name")[0].astype("Int64")
+            opt_long["opt_col"].str.extract(r"option(\d)Name")[0]
+            .astype("Int64")
         )
         opt_long["answer_text"] = opt_long["answer_text"].astype(str).str.strip()
         opt_long = opt_long[opt_long["answer_text"] != ""][["section_index", "question_index", "answer_code", "answer_text"]]
@@ -188,7 +187,10 @@ def _normalize_with_pandas(raw_text: str) -> pd.DataFrame:
     if not answer_cols:
         raise ValueError("No answer columns found like '1_1', '1_2', ... in data table")
 
-    id_vars = [c for c in ["timezone", "isoDate"] if c in data_df.columns]
+    id_vars = []
+    for c in ["timezone", "isoDate"]:
+        if c in data_df.columns:
+            id_vars.append(c)
 
     long_df = data_df.melt(
         id_vars=id_vars,
@@ -213,10 +215,17 @@ def _normalize_with_pandas(raw_text: str) -> pd.DataFrame:
     if "timezone" not in long_df.columns:
         long_df["timezone"] = ""
 
-    # Join questions + option text
+    # Join questions
     long_df = long_df.merge(qbase, on=["section_index", "question_index"], how="left")
-    long_df = long_df.merge(opt_long, on=["section_index", "question_index", "answer_code"], how="left")
 
+    # Join option text
+    long_df = long_df.merge(
+        opt_long,
+        on=["section_index", "question_index", "answer_code"],
+        how="left",
+    )
+
+    # Final cleanup
     for c in ["question_id", "question_text", "answer_text"]:
         if c in long_df.columns:
             long_df[c] = long_df[c].fillna("")
@@ -229,81 +238,44 @@ def _normalize_with_pandas(raw_text: str) -> pd.DataFrame:
     return out
 
 
-def _build_output_key(input_key: str) -> str:
-    """
-    Mimic your Step lambda behavior:
-    - by default, keep original object_key path
-    - OR, if OUTPUT_PREFIX is set, write under that prefix while keeping basename.
-    """
-    base = input_key.split("/")[-1]
-    if OUTPUT_PREFIX == "":
-        return input_key  # same key in destination bucket
-    return f"{OUTPUT_PREFIX.rstrip('/')}/{base.rsplit('.', 1)[0]}_normalized.csv"
-
-
-# ---------- Lambda entry (SQS-triggered) ----------
+# ---------- Lambda entry ----------
 def lambda_handler(event, context):
-    processed_files = []
-    failed_files = []
+    record = event["Records"][0]
+    bucket = record["s3"]["bucket"]["name"]
+    key = record["s3"]["object"]["key"]
 
-    for record in event["Records"]:
-        object_key = None
-        try:
-            # SQS message body pattern: {"source_bucket": "...", "object_key": "..."}
-            message = json.loads(record["body"])
-            source_bucket = message["source_bucket"]
-            object_key = message["object_key"]
+    logger.info("Processing S3 object s3://%s/%s", bucket, key)
 
-            if INPUT_PREFIX and not object_key.startswith(INPUT_PREFIX):
-                logger.info("Skipping %s because it is not under INPUT_PREFIX=%s", object_key, INPUT_PREFIX)
-                continue
+    obj = s3.get_object(Bucket=bucket, Key=key)
+    raw_text = _decode_bytes(obj["Body"].read())
 
-            logger.info("Processing file: s3://%s/%s", source_bucket, object_key)
+    # (Optional) log a few lines to debug formats safely
+    # logger.info("First 15 lines:\n%s", "\n".join(raw_text.splitlines()[:15]))
 
-            # Read file from source bucket
-            response = s3.get_object(Bucket=source_bucket, Key=object_key)
-            raw_text = _decode_bytes(response["Body"].read())
+    out_df = _normalize_with_pandas(raw_text)
 
-            # Transform (same logic as your survey transform)
-            out_df = _normalize_with_pandas(raw_text)
+    out_bucket = OUTPUT_BUCKET or bucket
+    base = key.split("/")[-1]
+    out_key = f"{OUTPUT_PREFIX}{base.rsplit('.', 1)[0]}_normalized.csv"
 
-            # Write to destination bucket with output key
-            out_key = _build_output_key(object_key)
+    buf = io.StringIO()
+    out_df.to_csv(buf, index=False)
 
-            buf = io.StringIO()
-            out_df.to_csv(buf, index=False)
+    s3.put_object(
+        Bucket=out_bucket,
+        Key=out_key,
+        Body=buf.getvalue().encode("utf-8"),
+        ContentType="text/csv",
+    )
 
-            s3.put_object(
-                Bucket=DESTINATION_BUCKET,
-                Key=out_key,
-                Body=buf.getvalue().encode("utf-8"),
-                ContentType="text/csv",
-            )
-
-            processed_files.append(
-                {
-                    "input": f"s3://{source_bucket}/{object_key}",
-                    "output": f"s3://{DESTINATION_BUCKET}/{out_key}",
-                    "rows_written": int(len(out_df)),
-                }
-            )
-
-            logger.info("Successfully processed: %s -> %s", object_key, out_key)
-
-        except Exception as e:
-            logger.exception("Error processing file %s", object_key)
-            failed_files.append({"file": object_key if object_key else "unknown", "error": str(e)})
+    logger.info("Wrote normalized file to s3://%s/%s rows=%d", out_bucket, out_key, len(out_df))
 
     return {
         "statusCode": 200,
-        "body": json.dumps(
-            {
-                "processed_files": len(processed_files),
-                "failed_files": len(failed_files),
-                "processed": processed_files if processed_files else None,
-                "failures": failed_files if failed_files else None,
-                "message": "Processed by SurveyNormalizationLambda",
-            },
-            indent=2,
-        ),
+        "input": {"bucket": bucket, "key": key},
+        "output": {"bucket": out_bucket, "key": out_key},
+        "rows_written": int(len(out_df)),
     }
+
+
+
