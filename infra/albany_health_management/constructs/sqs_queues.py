@@ -139,3 +139,10 @@ class SQSQueues(Construct):
                 queue=processing_files_dlq,
             ),
         )
+
+        self.survey_data_file_queue = sqs.Queue(
+            self,
+            f"AlbanyHealthSurveyDataProcessingFile-SQSQueue-{env_suffix}",
+            queue_name=f"AlbanyHealthSurveyDataProcessingFile-SQSQueue-{env_suffix}",
+            visibility_timeout=visibility_timeout
+        )

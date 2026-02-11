@@ -24,7 +24,9 @@ class LambdaFunctions(Construct):
     def __init__(self, scope: Construct, construct_id: str, 
                  main_queue, heart_rate_queue, others_queue, 
                  sleep_queue, step_queue,
+                 survey_data_file_queue,
                  processing_files_queue,source_bucket, 
+                 survey_data_merged_bucket,
                  processed_bucket, environment: EnvironmentConfig = None, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
         
@@ -63,6 +65,7 @@ class LambdaFunctions(Construct):
                 "HEALTH_SLEEP_QUEUE": sleep_queue.queue_url,
                 "HEALTH_STEP_QUEUE": step_queue.queue_url,
                 "HEALTH_OTHERS_QUEUE": others_queue.queue_url,
+                "HEALTH_SURVEY_DATA_QUEUE": survey_data_file_queue.queue_url,
             }
         )
 
@@ -153,6 +156,25 @@ class LambdaFunctions(Construct):
             memory_size=512,  # 512 MB - moderate memory for batch processing
         )
 
+        self.survey_data_normalise_function = lambda_.Function(
+            self,
+            f"AlbanyHealthSurveyDataNormaliseLambdaFunction{env_suffix.capitalize()}",
+            function_name=f"albanyHealth-survey-data-normalise-lambda-function-{env_suffix}",
+            runtime=lambda_.Runtime.PYTHON_3_13,
+            handler="main.lambda_handler",
+            code=lambda_.Code.from_asset(f"{services_base_path}/albanyHealth-survey-data-normalise-lambda-function"),
+            timeout=Duration.seconds(300),  # 5 minutes
+            memory_size=1024,  # 1024 MB - more memory for faster pandas processing
+            layers=[lambda_.LayerVersion.from_layer_version_arn(
+                self,
+                f"SurveyDataPandasLayer-{env_suffix.capitalize()}",
+                pandas_layer_arn
+            )],
+            environment={
+                "DESTINATION_BUCKET": survey_data_merged_bucket.bucket_name,
+            }
+        )
+
         # Create an IAM policy statement for the SQSs queue to invoke the function
         invoke_policy_statement = iam.PolicyStatement(
             effect=iam.Effect.ALLOW,
@@ -169,6 +191,7 @@ class LambdaFunctions(Construct):
         others_queue.grant_send_messages(self.main_router_function)
         sleep_queue.grant_send_messages(self.main_router_function)
         step_queue.grant_send_messages(self.main_router_function)
+        survey_data_file_queue.grant_send_messages(self.main_router_function)
 
         # Grant the main router function permission to consume messages from the main queue
         main_queue.grant_consume_messages(self.main_router_function)
@@ -187,24 +210,30 @@ class LambdaFunctions(Construct):
 
         # Grant the inactivity checker function permission to consume messages from the processing files queue
         processing_files_queue.grant_consume_messages(self.data_inactivity_checker_function)
+        survey_data_file_queue.grant_consume_messages(self.survey_data_normalise_function)
 
 
-        # Grant read access to the source_bucket for the heart rate, step, sleep, and other functions
+        # Grant read access to the source_bucket for the heart rate, step, sleep, other and survey data functions
         source_bucket.grant_read(self.heart_rate_function)
         source_bucket.grant_read(self.step_function)
         source_bucket.grant_read(self.sleep_function)
         source_bucket.grant_read(self.other_metrics_function)
+        source_bucket.grant_read(self.survey_data_normalise_function)
 
         # Grant write access to the processed_bucket for the heart rate, step, sleep, and other functions
         processed_bucket.grant_write(self.heart_rate_function)
         processed_bucket.grant_write(self.step_function)
         processed_bucket.grant_write(self.sleep_function)
         processed_bucket.grant_write(self.other_metrics_function)
+
+        #Grant write access
+        survey_data_merged_bucket.grant_write(self.survey_data_normalise_function)
         
         # Grant read and write access to the processed_bucket for the data inactivity checker function
         # It needs ListBucket permission to check for batch.json files and read/write them
         processed_bucket.grant_read(self.data_inactivity_checker_function)
         processed_bucket.grant_write(self.data_inactivity_checker_function)
+
 
         # Create Lambda functions to activate Glue CONDITIONAL triggers after deployment
         # These ensure triggers are ACTIVATED without manual intervention
