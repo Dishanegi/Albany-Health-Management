@@ -6,12 +6,12 @@ from botocore.exceptions import ClientError
 def extract_folder_name(object_key):
     """
     Extracts the folder name from object key
-    Example input: 'Health_20Gizmo-08022025/Testing-1_cd037752/garmin-device-heart-rate/250204_garmin-device-heart-rate_Testing-1_cd037752.csv'
+    Example input: 'Testing-1_cd037752/garmin-device-heart-rate/250204_garmin-device-heart-rate_Testing-1_cd037752.csv'
     Should return: 'garmin-device-heart-rate'
     """
     path_segments = object_key.split('/')
-    if len(path_segments) >= 3:  # Ensure we have enough segments
-        return path_segments[2]  # Return the third segment (index 2)
+    if len(path_segments) >= 2:  # Ensure we have enough segments
+        return path_segments[1]  # Return the second segment (index 1)
     return ''
 
 def get_queue_url_for_folder(folder_name):

@@ -11,7 +11,7 @@ def extract_participantId(object_key):
     """
     Extracts the participant ID from the object key
     """
-    match = re.search(r'_([a-z0-9]{8})\.csv$', object_key)
+    match = re.search(r'_([a-zA-Z0-9]{8})\.csv$', object_key)
     return match.group(1) if match else None
 
 def format_iso_date_to_timestamp(iso_date_str):

@@ -374,55 +374,53 @@ def process_s3_event_with_race_protection(s3_record: Dict[str, Any], s3_client, 
         }
 
 def update_batch_json_with_race_protection(s3_client, bucket_name: str, batch_info: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Update batch.json with race condition protection using S3 conditional writes and exponential backoff
-    """
     batch_folder = batch_info['batch_folder']
     patient_id = batch_info['patient_id']
     file_type = batch_info['file_type']
     filename = batch_info['filename']
     event_fingerprint = batch_info['event_fingerprint']
     batch_json_key = f"{batch_folder}/batch.json"
-    
+
     logger.info(f"Updating batch.json with race protection: {batch_json_key}")
-    
-    # Get expected file counts once at the beginning for consistency throughout the function
+
     expected_file_counts = get_expected_file_counts()
-    
+
     for attempt in range(MAX_RETRY_ATTEMPTS):
         try:
-            # Step 1: Get current batch.json with ETag for conditional updates
+            # Step 1: Get current batch.json or create new structure
             current_etag = None
-            batch_data = None
             was_already_complete = False
-            
+
             try:
                 response = s3_client.get_object(Bucket=bucket_name, Key=batch_json_key)
                 batch_data = json.loads(response['Body'].read().decode('utf-8'))
-                current_etag = response['ETag'].strip('"')  # Remove quotes from ETag
+                current_etag = response['ETag'].strip('"')
                 was_already_complete = batch_data.get('status') == 'complete'
                 logger.info(f"Attempt {attempt + 1}: Found existing batch.json with ETag: {current_etag}")
             except ClientError as e:
                 if e.response['Error']['Code'] == 'NoSuchKey':
-                    # Create new batch.json structure
+                    # ✅ Flat structure — no nested 'patients' dict
                     batch_data = {
                         'batch_id': batch_folder,
+                        'patient_id': patient_id,
                         'created_at': datetime.utcnow().isoformat(),
-                        'patients': {},
+                        'file_counts': {ft: 0 for ft in expected_file_counts.keys()},
+                        'processed_files': [],
                         'processed_events': [],
+                        'total_files': 0,
+                        'expected_files': sum(expected_file_counts.values()),
                         'status': 'processing',
+                        'is_complete': False,
                         'last_updated': datetime.utcnow().isoformat(),
-                        'expected_patients': None,
-                        'completion_criteria': 'all_patients_complete',
-                        'version': 1  # Add version tracking
+                        'version': 1
                     }
-                    current_etag = None  # No ETag for new file
+                    current_etag = None
                     was_already_complete = False
                     logger.info(f"Attempt {attempt + 1}: Creating new batch.json structure")
                 else:
                     raise e
-            
-            # Step 2: Check if this exact event was already processed (idempotency)
+
+            # Step 2: Check event-level deduplication
             processed_events = batch_data.get('processed_events', [])
             if event_fingerprint in processed_events:
                 logger.info(f"Event {event_fingerprint} already processed - returning early")
@@ -432,27 +430,10 @@ def update_batch_json_with_race_protection(s3_client, bucket_name: str, batch_in
                     'batch_json_key': batch_json_key,
                     'retry_attempts': attempt
                 }
-            
-            # Step 3: Apply the update logic
+
+            # Step 3: Check file-level deduplication
             file_id = f"{file_type}/{filename}"
-            
-            # Initialize patient if not exists
-            if patient_id not in batch_data['patients']:
-                batch_data['patients'][patient_id] = {
-                    'file_counts': {ft: 0 for ft in expected_file_counts.keys()},
-                    'processed_files': [],
-                    'total_files': 0,
-                    'expected_files': sum(expected_file_counts.values()),
-                    'is_complete': False,
-                    'first_file_received': datetime.utcnow().isoformat(),
-                    'last_file_received': datetime.utcnow().isoformat()
-                }
-                logger.info(f"Initialized new patient: {patient_id}")
-            
-            patient_data = batch_data['patients'][patient_id]
-            
-            # Check if this specific file was already processed
-            if file_id in patient_data.get('processed_files', []):
+            if file_id in batch_data.get('processed_files', []):
                 logger.info(f"File {file_id} already processed for patient {patient_id}")
                 return {
                     'already_processed': True,
@@ -461,135 +442,109 @@ def update_batch_json_with_race_protection(s3_client, bucket_name: str, batch_in
                     'batch_json_key': batch_json_key,
                     'retry_attempts': attempt
                 }
-            
-            # Apply the update
+
+            # Step 4: Apply the update — flat structure, no patients dict
             processed_events.append(event_fingerprint)
-            patient_data['processed_files'].append(file_id)
-            patient_data['last_file_received'] = datetime.utcnow().isoformat()
-            
-            # Update file count
-            if file_type in patient_data['file_counts']:
-                old_count = patient_data['file_counts'][file_type]
-                patient_data['file_counts'][file_type] += 1
-                patient_data['total_files'] += 1
-                logger.info(f"Updated file count for {file_type}: {old_count} -> {patient_data['file_counts'][file_type]}")
-            
-            # Calculate completion status
-            patient_total_files = sum(patient_data['file_counts'].values())
-            patient_expected_files = patient_data['expected_files']
-            patient_completion_percentage = (patient_total_files / patient_expected_files) * 100
-            
-            patient_meets_threshold = patient_completion_percentage >= COMPLETION_THRESHOLD_PERCENTAGE
-            patient_traditional_complete = all(
-                patient_data['file_counts'][ft] >= expected_count 
+            batch_data['processed_files'].append(file_id)
+            batch_data['last_file_received'] = datetime.utcnow().isoformat()
+
+            if file_type in batch_data['file_counts']:
+                old_count = batch_data['file_counts'][file_type]
+                batch_data['file_counts'][file_type] += 1
+                batch_data['total_files'] += 1
+                logger.info(f"Updated file count for {file_type}: {old_count} -> {batch_data['file_counts'][file_type]}")
+
+            # Step 5: Calculate completion
+            total_files = batch_data['total_files']
+            expected_files = batch_data['expected_files']
+            completion_percentage = (total_files / expected_files) * 100 if expected_files > 0 else 0
+
+            meets_threshold = completion_percentage >= COMPLETION_THRESHOLD_PERCENTAGE
+            traditional_complete = all(
+                batch_data['file_counts'][ft] >= expected_count
                 for ft, expected_count in expected_file_counts.items()
             )
-            
-            patient_complete = patient_meets_threshold or patient_traditional_complete
-            patient_data['is_complete'] = patient_complete
-            patient_data['completion_percentage'] = round(patient_completion_percentage, 2)
-            patient_data['completion_method'] = (
-                'traditional' if patient_traditional_complete 
-                else 'threshold' if patient_meets_threshold 
+
+            is_complete = meets_threshold or traditional_complete
+            batch_data['is_complete'] = is_complete
+            batch_data['completion_percentage'] = round(completion_percentage, 2)
+            batch_data['completion_method'] = (
+                'traditional' if traditional_complete
+                else 'threshold' if meets_threshold
                 else 'incomplete'
             )
-            
-            # Calculate batch completion
-            total_patients = len(batch_data['patients'])
-            complete_patients = sum(1 for p in batch_data['patients'].values() if p['is_complete'])
-            all_patients_meet_threshold = all(
-                patient['is_complete'] for patient in batch_data['patients'].values()
-            )
-            
-            total_files_in_batch = sum(
-                sum(p['file_counts'].values()) for p in batch_data['patients'].values()
-            )
-            total_expected_files_in_batch = total_patients * sum(expected_file_counts.values())
-            batch_completion_percentage = (total_files_in_batch / total_expected_files_in_batch) * 100 if total_expected_files_in_batch > 0 else 0
-            
+
             batch_newly_completed = False
-            if all_patients_meet_threshold and batch_data['patients'] and not was_already_complete:
+            if is_complete and not was_already_complete:
                 batch_data['status'] = 'complete'
                 batch_data['completed_at'] = datetime.utcnow().isoformat()
                 batch_data['completion_strategy'] = 'threshold_based'
                 batch_data['completion_threshold'] = COMPLETION_THRESHOLD_PERCENTAGE
                 batch_newly_completed = True
                 logger.info(f"BATCH {batch_folder} has just become COMPLETE!")
-            
-            # Update metadata
+
+            # Step 6: Update metadata
             batch_data['processed_events'] = processed_events
             batch_data['last_updated'] = datetime.utcnow().isoformat()
-            batch_data['version'] = batch_data.get('version', 1) + 1  # Increment version
+            batch_data['version'] = batch_data.get('version', 1) + 1
             batch_data['stats'] = {
-                'total_patients': total_patients,
-                'complete_patients': complete_patients,
-                'incomplete_patients': total_patients - complete_patients,
-                'total_files_processed': total_files_in_batch,
-                'total_expected_files': total_expected_files_in_batch,
-                'batch_completion_percentage': round(batch_completion_percentage, 2),
+                'total_files_processed': total_files,
+                'total_expected_files': expected_files,
+                'completion_percentage': round(completion_percentage, 2),
                 'completion_threshold': COMPLETION_THRESHOLD_PERCENTAGE,
                 'completion_strategy': 'threshold_based'
             }
-            
-            # Clean up old processed events
+
             if len(processed_events) > 1000:
                 batch_data['processed_events'] = processed_events[-1000:]
-            
-            # Step 4: Conditional write to S3 using ETag
+
+            # Step 7: Conditional write
             put_object_args = {
                 'Bucket': bucket_name,
                 'Key': batch_json_key,
                 'Body': json.dumps(batch_data, indent=2),
                 'ContentType': 'application/json'
             }
-            
-            # Add conditional write parameter if we have an ETag
+
             if current_etag:
                 put_object_args['IfMatch'] = current_etag
                 logger.info(f"Attempt {attempt + 1}: Conditional write with ETag: {current_etag}")
             else:
-                # For new files, ensure it doesn't exist
                 put_object_args['IfNoneMatch'] = '*'
                 logger.info(f"Attempt {attempt + 1}: Creating new file with IfNoneMatch=*")
-            
-            # Attempt the conditional write
+
             s3_client.put_object(**put_object_args)
-            
             logger.info(f"Attempt {attempt + 1}: Successfully updated batch.json for {batch_folder}")
-            
-            # Success! Return the result
+
             return {
                 'already_processed': False,
                 'batch_json_updated': True,
-                'patient_complete': patient_complete,
+                'patient_complete': is_complete,
                 'batch_complete': batch_data['status'] == 'complete',
                 'batch_newly_completed': batch_newly_completed,
-                'patient_file_counts': {patient_id: patient_data['file_counts'] for patient_id, patient in batch_data['patients'].items()},
+                # ✅ Kept same key name so trigger_batch_complete_events still works
+                'patient_file_counts': {patient_id: batch_data['file_counts']},
                 'batch_json_key': batch_json_key,
                 'event_fingerprint': event_fingerprint,
                 'retry_attempts': attempt,
                 'version': batch_data['version'],
                 'debug_info': {
-                    'total_patients': total_patients,
-                    'complete_patients': complete_patients,
-                    'all_patients_meet_threshold': all_patients_meet_threshold,
-                    'batch_completion_percentage': round(batch_completion_percentage, 2),
-                    'completion_threshold': COMPLETION_THRESHOLD_PERCENTAGE
+                    'completion_percentage': round(completion_percentage, 2),
+                    'completion_threshold': COMPLETION_THRESHOLD_PERCENTAGE,
+                    'meets_threshold': meets_threshold,
+                    'traditional_complete': traditional_complete
                 }
             }
-            
+
         except ClientError as e:
-            # Handle conditional write failures (race conditions)
             if e.response['Error']['Code'] in ['PreconditionFailed', 'ConditionalRequestConflict']:
-                # Another Lambda updated the file between our read and write
                 retry_delay = min(BASE_RETRY_DELAY * (2 ** attempt) + random.uniform(0, 0.1), MAX_RETRY_DELAY)
-                logger.warning(f"Attempt {attempt + 1}: Race condition detected, retrying in {retry_delay:.3f}s - {e.response['Error']['Code']}")
-                
-                if attempt < MAX_RETRY_ATTEMPTS - 1:  # Don't sleep on the last attempt
+                logger.warning(f"Attempt {attempt + 1}: Race condition detected, retrying in {retry_delay:.3f}s")
+                if attempt < MAX_RETRY_ATTEMPTS - 1:
                     time.sleep(retry_delay)
-                    continue  # Retry the operation
+                    continue
                 else:
-                    logger.error(f"Race condition: Max retry attempts ({MAX_RETRY_ATTEMPTS}) exceeded for {batch_json_key}")
+                    logger.error(f"Race condition: Max retry attempts ({MAX_RETRY_ATTEMPTS}) exceeded")
                     return {
                         'batch_json_updated': False,
                         'error': f"Race condition: Max retry attempts exceeded after {MAX_RETRY_ATTEMPTS} tries",
@@ -597,49 +552,49 @@ def update_batch_json_with_race_protection(s3_client, bucket_name: str, batch_in
                         'error_type': 'race_condition_max_retries'
                     }
             else:
-                # Other S3 errors
-                logger.error(f"Attempt {attempt + 1}: S3 error updating batch.json: {e.response['Error']['Code']} - {e.response['Error']['Message']}")
+                logger.error(f"Attempt {attempt + 1}: S3 error: {e.response['Error']['Code']} - {e.response['Error']['Message']}")
                 return {
                     'batch_json_updated': False,
                     'error': f"S3 error: {e.response['Error']['Message']}",
                     'retry_attempts': attempt,
                     'error_type': 's3_error'
                 }
-        
+
         except Exception as e:
-            logger.error(f"Attempt {attempt + 1}: Unexpected error updating batch.json: {str(e)}")
+            logger.error(f"Attempt {attempt + 1}: Unexpected error: {str(e)}")
             return {
                 'batch_json_updated': False,
                 'error': str(e),
                 'retry_attempts': attempt,
                 'error_type': 'unexpected_error'
             }
-    
-    # This should never be reached due to the logic above, but just in case
+
     return {
         'batch_json_updated': False,
         'error': 'Unknown error in race protection loop',
         'retry_attempts': MAX_RETRY_ATTEMPTS,
         'error_type': 'unknown_error'
     }
-
 def parse_object_key(object_key: str) -> Dict[str, Any]:
     """
     Parse S3 object key to extract batch and patient information
+    New format: Testing-1_cd037752/garmin-device-heart-rate/250204_garmin-device-heart-rate_Testing-1_cd037752.csv
     """
     try:
         logger.info(f"Parsing object key: {object_key}")
         
         path_parts = object_key.split('/')
         
-        if len(path_parts) < 4:
-            logger.warning(f"Not enough path parts: {len(path_parts)}, expected at least 4")
+        if len(path_parts) < 3:  # ✅ updated from 4 to 3
+            logger.warning(f"Not enough path parts: {len(path_parts)}, expected at least 3")
             return None
         
-        batch_folder = path_parts[0]
-        patient_id = path_parts[1]
-        file_type = path_parts[2]
-        filename = path_parts[3]
+        patient_id = path_parts[0]   # 'Testing-1_cd037752'
+        file_type = path_parts[1]    # 'garmin-device-respiration'
+        filename = path_parts[2]     # '260119_garmin-device-respiration_Testing-1_cd037752.csv'
+        
+        # ✅ Use patient_id as the batch folder since there's no separate batch segment
+        batch_folder = patient_id
         
         expected_file_counts = get_expected_file_counts()
         if file_type not in expected_file_counts:

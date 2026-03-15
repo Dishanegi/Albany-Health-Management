@@ -1,309 +1,167 @@
 import json
 import os
-import io
-import re
-import csv
-import logging
-from typing import Tuple, Dict, List, Optional
-
 import boto3
 import pandas as pd
+from io import StringIO
+import re
+from datetime import datetime
 
-# ---------- AWS clients ----------
-s3 = boto3.client("s3")
-
-# ---------- Config ----------
-# Match your working SQS pattern: destination bucket comes from env
-DESTINATION_BUCKET = os.environ.get("DESTINATION_BUCKET")
-if not DESTINATION_BUCKET:
-    raise RuntimeError("Missing required env var DESTINATION_BUCKET")
-
-# Optional: folder prefix in destination bucket
-OUTPUT_PREFIX = os.environ.get("OUTPUT_PREFIX", "normalized/")
-
-# Optional: if you want to keep same key path, set OUTPUT_PREFIX="" and it'll write to same key
-# Optional: only process if object_key starts with this prefix
-INPUT_PREFIX = os.environ.get("INPUT_PREFIX")
-
-# Match Labfront answer columns like "1_1", "1_2", ...
-ANSWER_COL_RE = re.compile(r"^\d+_\d+$")
-
-OUT_COLS = [
-    "participant_id",
-    "submission_ts",
-    "timezone",
-    "section_index",
-    "question_index",
-    "question_id",
-    "question_text",
-    "answer_code",
-    "answer_text",
-]
-
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
-
-
-# ---------- Helpers ----------
-def _decode_bytes(b: bytes) -> str:
-    for enc in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
-        try:
-            return b.decode(enc)
-        except UnicodeDecodeError:
-            continue
-    raise ValueError("Unable to decode input file")
-
-
-def _read_meta(lines) -> dict:
+def extract_participantId(object_key):
     """
-    Find meta table starting with 'projectId,...' and parse the next row safely.
-    Uses Python csv.reader (robust to odd quoting when parsing a single line).
-
-    NOTE: This still assumes the meta row is on ONE physical line.
-    If your meta has embedded newlines in quoted fields, switch to the full-file csv.reader approach.
+    Extracts the participant ID from the object key
     """
-    for i, ln in enumerate(lines):
-        if ln.strip().startswith("projectId"):
-            if i + 1 >= len(lines):
-                return {}
+    match = re.search(r'_([a-zA-Z0-9]{8})\.csv$', object_key)
+    return match.group(1) if match else None
 
-            header = next(csv.reader([lines[i]]))
-            row = next(csv.reader([lines[i + 1]]))
-
-            # pad/truncate row to match header length
-            if len(row) < len(header):
-                row += [""] * (len(header) - len(row))
-            if len(row) > len(header):
-                row = row[:len(header)]
-
-            return dict(zip(header, row))
-
-    return {}
-
-
-def _read_key_table(lines) -> Tuple[pd.DataFrame, int]:
-    key_start = None
-    data_start = None
-
-    for i, ln in enumerate(lines):
-        s = ln.strip()
-        if key_start is None and s.startswith("sectionIndex"):
-            key_start = i
-        if s.startswith("timezone"):
-            data_start = i
-            break
-
-    if key_start is None:
-        raise ValueError("Missing key table header (sectionIndex...)")
-    if data_start is None:
-        raise ValueError("Missing data table header (timezone...)")
-
-    key_csv = "\n".join([l for l in lines[key_start:data_start] if l.strip() != ""])
-
-    key_df = pd.read_csv(
-        io.StringIO(key_csv),
-        dtype=str,
-        engine="python",
-        keep_default_na=False,
-        on_bad_lines="skip",
-    )
-
-    return key_df, data_start
-
-
-def _read_data_table(lines, data_start: int) -> pd.DataFrame:
-    data_csv = "\n".join([l for l in lines[data_start:] if l.strip() != ""])
-
-    data_df = pd.read_csv(
-        io.StringIO(data_csv),
-        dtype=str,
-        engine="python",
-        keep_default_na=False,
-        on_bad_lines="skip",
-    )
-
-    return data_df
-
-
-def _normalize_with_pandas(raw_text: str) -> pd.DataFrame:
+def format_timestamp_from_iso(iso_date):
     """
-    Convert Labfront export from wide format to normalized long format (AFTER).
-    Transformation logic remains the same.
+    Formats ISO date string to yyyy-mm-dd hh:mm format (removing seconds)
     """
-    lines = raw_text.splitlines()
+    try:
+        # Parse the ISO date string
+        dt = datetime.fromisoformat(iso_date.replace('Z', '+00:00'))
+        # Format with just minutes, no seconds
+        return dt.strftime('%Y-%m-%d %H:%M')
+    except (ValueError, AttributeError):
+        # Return original value if parsing fails
+        return iso_date
 
-    # ---- Meta ----
-    meta = _read_meta(lines)
-    participant_id = str(meta.get("participantId") or meta.get("participant_id") or "").strip()
-
-    # ---- Key table + Data table ----
-    key_df, data_start = _read_key_table(lines)
-    data_df = _read_data_table(lines, data_start)
-
-    # ---- Decide which column contains question text ----
-    if "questionDescription" in key_df.columns:
-        qtext_col = "questionDescription"
-    elif "questionDescript" in key_df.columns:
-        qtext_col = "questionDescript"
-    elif "questionName" in key_df.columns:
-        qtext_col = "questionName"
-    else:
-        qtext_col = None
-
-    # ---- Build question dimension (section_index, question_index -> id, text) ----
-    qdim = key_df.copy()
-
-    if "sectionIndex" not in qdim.columns or "questionIndex" not in qdim.columns:
-        raise ValueError("Key table missing sectionIndex/questionIndex columns")
-
-    qdim["section_index"] = pd.to_numeric(qdim["sectionIndex"], errors="coerce")
-    qdim["question_index"] = pd.to_numeric(qdim["questionIndex"], errors="coerce")
-
-    qdim["question_id"] = qdim["questionId"] if "questionId" in qdim.columns else ""
-    qdim["question_text"] = qdim[qtext_col] if qtext_col else ""
-
-    qbase = (
-        qdim[["section_index", "question_index", "question_id", "question_text"]]
-        .dropna(subset=["section_index", "question_index"])
-        .drop_duplicates()
-    )
-
-    # ---- Build options long table: (section_index, question_index, answer_code -> answer_text) ----
-    option_cols = [c for c in qdim.columns if re.match(r"^option[1-5]Name$", str(c))]
-    if option_cols:
-        opt_long = (
-            qdim[["section_index", "question_index"] + option_cols]
-            .melt(id_vars=["section_index", "question_index"], var_name="opt_col", value_name="answer_text")
+def process_step_data(df, participant_id):
+    """
+    Processes step data and returns only unique rows
+    """
+    # Add participant ID
+    df['participant_id'] = participant_id
+    
+    # Add timestamp column from isoDate before dropping it
+    if 'isoDate' in df.columns:
+        df.insert(
+            df.columns.get_loc('isoDate') + 1,
+            'Timestamp',
+            df['isoDate'].apply(format_timestamp_from_iso)
         )
-        opt_long["answer_code"] = (
-            opt_long["opt_col"].str.extract(r"option(\d)Name")[0].astype("Int64")
-        )
-        opt_long["answer_text"] = opt_long["answer_text"].astype(str).str.strip()
-        opt_long = opt_long[opt_long["answer_text"] != ""][["section_index", "question_index", "answer_code", "answer_text"]]
-    else:
-        opt_long = pd.DataFrame(columns=["section_index", "question_index", "answer_code", "answer_text"])
+        
+        # Add the new column: participantid_timestamp
+        df['participantid_timestamp'] = df['participant_id'] + '_' + df['Timestamp'].astype(str)
+    
+    # Delete specified columns - modified to keep isoDate and unixTimestampInMs
+    columns_to_drop = ['durationInMs', 'deviceType', 'timezone', 'isoDate']
+    df = df.drop(columns=[col for col in columns_to_drop if col in df.columns], errors='ignore')
+    
+    # Reorder columns to make participant_id first
+    cols = ['participant_id'] + [col for col in df.columns if col != 'participant_id']
+    df = df[cols]
+    
+    # Drop duplicate rows to keep only unique entries
+    df_before = len(df)
+    df = df.drop_duplicates()
+    df_after = len(df)
+    
+    # Log the number of duplicates removed
+    duplicates_removed = df_before - df_after
+    if duplicates_removed > 0:
+        print(f"Removed {duplicates_removed} duplicate rows")
+    
+    return df
 
-    # ---- Melt response table from wide to long ----
-    answer_cols = [c for c in data_df.columns if ANSWER_COL_RE.match(str(c))]
-    if not answer_cols:
-        raise ValueError("No answer columns found like '1_1', '1_2', ... in data table")
-
-    id_vars = [c for c in ["timezone", "isoDate"] if c in data_df.columns]
-
-    long_df = data_df.melt(
-        id_vars=id_vars,
-        value_vars=answer_cols,
-        var_name="section_question",
-        value_name="answer_code_raw",
-    )
-
-    # Split "1_2" => section_index=1, question_index=2
-    sq = long_df["section_question"].astype(str).str.split("_", expand=True)
-    long_df["section_index"] = pd.to_numeric(sq[0], errors="coerce")
-    long_df["question_index"] = pd.to_numeric(sq[1], errors="coerce")
-
-    # Clean answer_code: "", "2", "2.0" => Int64
-    long_df["answer_code_raw"] = long_df["answer_code_raw"].astype(str).str.strip()
-    long_df.loc[long_df["answer_code_raw"] == "", "answer_code_raw"] = pd.NA
-    long_df["answer_code"] = pd.to_numeric(long_df["answer_code_raw"], errors="coerce").round().astype("Int64")
-
-    # Attach participant_id + submission_ts
-    long_df["participant_id"] = participant_id
-    long_df["submission_ts"] = long_df["isoDate"] if "isoDate" in long_df.columns else ""
-    if "timezone" not in long_df.columns:
-        long_df["timezone"] = ""
-
-    # Join questions + option text
-    long_df = long_df.merge(qbase, on=["section_index", "question_index"], how="left")
-    long_df = long_df.merge(opt_long, on=["section_index", "question_index", "answer_code"], how="left")
-
-    for c in ["question_id", "question_text", "answer_text"]:
-        if c in long_df.columns:
-            long_df[c] = long_df[c].fillna("")
-
-    out = long_df[OUT_COLS].sort_values(
-        ["participant_id", "submission_ts", "section_index", "question_index"],
-        kind="stable",
-    )
-
-    return out
-
-
-def _build_output_key(input_key: str) -> str:
-    """
-    Mimic your Step lambda behavior:
-    - by default, keep original object_key path
-    - OR, if OUTPUT_PREFIX is set, write under that prefix while keeping basename.
-    """
-    base = input_key.split("/")[-1]
-    if OUTPUT_PREFIX == "":
-        return input_key  # same key in destination bucket
-    return f"{OUTPUT_PREFIX.rstrip('/')}/{base.rsplit('.', 1)[0]}_normalized.csv"
-
-
-# ---------- Lambda entry (SQS-triggered) ----------
 def lambda_handler(event, context):
+    # Initialize S3 client
+    s3 = boto3.client('s3')
+    destination_bucket = os.environ.get('DESTINATION_BUCKET')
+    
     processed_files = []
     failed_files = []
 
-    for record in event["Records"]:
-        object_key = None
+    for record in event['Records']:
+        object_key = None  # Initialize to avoid NameError
         try:
-            # SQS message body pattern: {"source_bucket": "...", "object_key": "..."}
-            message = json.loads(record["body"])
-            source_bucket = message["source_bucket"]
-            object_key = message["object_key"]
+            # Parse message body
+            message = json.loads(record['body'])
+            source_bucket = message['source_bucket']
+            object_key = message['object_key']
 
-            if INPUT_PREFIX and not object_key.startswith(INPUT_PREFIX):
-                logger.info("Skipping %s because it is not under INPUT_PREFIX=%s", object_key, INPUT_PREFIX)
-                continue
+            print(f"Processing file: s3://{source_bucket}/{object_key}")
 
-            logger.info("Processing file: s3://%s/%s", source_bucket, object_key)
+            # Extract participant ID
+            participant_id = extract_participantId(object_key)
+            if not participant_id:
+                raise ValueError(f"Could not extract participant ID from {object_key}")
 
-            # Read file from source bucket
+            # Read file from S3
             response = s3.get_object(Bucket=source_bucket, Key=object_key)
-            raw_text = _decode_bytes(response["Body"].read())
+            file_content = response['Body'].read().decode('utf-8')
 
-            # Transform (same logic as your survey transform)
-            out_df = _normalize_with_pandas(raw_text)
+            # Parse CSV
+            df = pd.read_csv(StringIO(file_content), skiprows=6, encoding='utf-8')
+            print(f"Original columns: {df.columns.tolist()}")
+            print(f"Original row count: {len(df)}")
+            
+            # Process data and keep only unique rows
+            processed_df = process_step_data(df, participant_id)
+            print(f"Processed columns: {processed_df.columns.tolist()}")
+            print(f"Processed row count (after deduplication): {len(processed_df)}")
 
-            # Write to destination bucket with output key
-            out_key = _build_output_key(object_key)
+            # Convert to CSV
+            output_buffer = StringIO()
+            processed_df.to_csv(output_buffer, index=False)
 
-            buf = io.StringIO()
-            out_df.to_csv(buf, index=False)
-
+            # Upload processed file to destination
             s3.put_object(
-                Bucket=DESTINATION_BUCKET,
-                Key=out_key,
-                Body=buf.getvalue().encode("utf-8"),
-                ContentType="text/csv",
+                Bucket=destination_bucket,
+                Key=object_key,
+                Body=output_buffer.getvalue(),
+                ContentType='text/csv'
             )
 
-            processed_files.append(
-                {
-                    "input": f"s3://{source_bucket}/{object_key}",
-                    "output": f"s3://{DESTINATION_BUCKET}/{out_key}",
-                    "rows_written": int(len(out_df)),
-                }
-            )
-
-            logger.info("Successfully processed: %s -> %s", object_key, out_key)
+            processed_files.append({
+                'file': object_key,
+                'original_rows': len(df),
+                'unique_rows': len(processed_df),
+                'duplicates_removed': len(df) - len(processed_df)
+            })
+            print(f"Successfully processed: {object_key}")
 
         except Exception as e:
-            logger.exception("Error processing file %s", object_key)
-            failed_files.append({"file": object_key if object_key else "unknown", "error": str(e)})
+            print(f"Error processing file: {str(e)}")
+            failed_files.append({
+                'file': object_key if object_key else 'unknown',
+                'error': str(e)
+            })
 
-    return {
-        "statusCode": 200,
-        "body": json.dumps(
-            {
-                "processed_files": len(processed_files),
-                "failed_files": len(failed_files),
-                "processed": processed_files if processed_files else None,
-                "failures": failed_files if failed_files else None,
-                "message": "Processed by SurveyNormalizationLambda",
-            },
-            indent=2,
-        ),
+    # Prepare the response
+    response = {
+        'statusCode': 200,
+        'body': json.dumps({
+            'processed_files': len(processed_files),
+            'failed_files': len(failed_files),
+            'failures': failed_files if failed_files else None,
+            'processed': processed_files if processed_files else None,
+            'message': 'Processed by HealthHeartRateFunction_DEV'
+        }, indent=2)
     }
+
+    # Log the complete response
+    print("Lambda Execution Summary:")
+    print("-" * 50)
+    print(f"Total Files Processed: {len(processed_files)}")
+    print(f"Total Files Failed: {len(failed_files)}")
+    
+    if processed_files:
+        print("\nSuccessfully Processed Files:")
+        for file in processed_files:
+            print(f"✓ {file['file']}")
+            print(f"  Original rows: {file['original_rows']}")
+            print(f"  Unique rows: {file['unique_rows']}")
+            print(f"  Duplicates removed: {file['duplicates_removed']}")
+    
+    if failed_files:
+        print("\nFailed Files:")
+        for file in failed_files:
+            print(f"✗ {file['file']}")
+            print(f"  Error: {file['error']}")
+    
+    print("\nComplete Response:")
+    print(json.dumps(response, indent=2))
+    print("-" * 50)
+
+    return response

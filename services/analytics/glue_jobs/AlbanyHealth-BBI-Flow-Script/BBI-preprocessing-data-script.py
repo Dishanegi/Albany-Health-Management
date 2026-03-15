@@ -37,7 +37,7 @@ def log_info(message):
 # Extract participant ID from file path
 def extract_participant_id(file_path):
     """Extract participant ID from file path"""
-    match = re.search(r'_([a-z0-9]{8})\.csv$', file_path)
+    match = re.search(r'_([a-zA-Z0-9]{8})\.csv$', file_path)
     return match.group(1) if match else None
 
 # Format ISO timestamp
