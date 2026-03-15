@@ -24,12 +24,12 @@ class LambdaFunctions(Construct):
     def __init__(self, scope: Construct, construct_id: str, 
                  main_queue, heart_rate_queue, others_queue, 
                  sleep_queue, step_queue,
+                 processing_files_queue,
                  survey_data_file_queue,
-                 processing_files_queue,source_bucket, 
-                 survey_data_merged_bucket,
-                 processed_bucket, environment: EnvironmentConfig = None, **kwargs) -> None:
+                 source_bucket, 
+                 processed_bucket,
+                 survey_data_merged_bucket, environment: EnvironmentConfig = None, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
-        
         # Default to dev environment if not provided
         if environment is None:
             from ..config import get_environment
@@ -327,6 +327,7 @@ class LambdaFunctions(Construct):
             self.data_inactivity_checker_function,
             self.activate_garmin_triggers_lambda,
             self.activate_bbi_triggers_lambda,
+            self.survey_data_normalise_function
         ]
         
         for func in lambda_functions:

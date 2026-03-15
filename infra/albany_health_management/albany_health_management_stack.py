@@ -42,8 +42,10 @@ class AlbanyHealthManagementStack(Stack):
             sqs_queues.sleep_queue,
             sqs_queues.step_queue,
             sqs_queues.processing_files_queue,
+            sqs_queues.survey_data_file_queue,
             s3_buckets.source_bucket,
             s3_buckets.processed_bucket,
+            s3_buckets.survey_data_merged_bucket,
             environment=env_config,
         )
         
@@ -150,6 +152,9 @@ class AlbanyHealthManagementStack(Stack):
 
         # Configure the step SQS queue to trigger the step Lambda function
         lambda_functions.step_function.add_event_source(lambda_event_sources.SqsEventSource(sqs_queues.step_queue))
+
+        # Configure the step SQS queue to trigger the survey-data-normalise-lambda-function
+        lambda_functions.survey_data_normalise_function.add_event_source(lambda_event_sources.SqsEventSource(sqs_queues.survey_data_file_queue))
 
         # Configure the processing SQS queue to trigger the inactivity checker Lambda function
         lambda_functions.data_inactivity_checker_function.add_event_source(lambda_event_sources.SqsEventSource(sqs_queues.processing_files_queue))

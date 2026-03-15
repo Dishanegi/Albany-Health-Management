@@ -22,14 +22,16 @@ def get_queue_url_for_folder(folder_name):
     queue_mapping = {
         'garmin-device-heart-rate': os.environ.get('HEALTH_HEART_RATE_QUEUE'),
         'garmin-connect-sleep-stage': os.environ.get('HEALTH_SLEEP_QUEUE'),
-        'garmin-device-step': os.environ.get('HEALTH_STEP_QUEUE')
+        'garmin-device-step': os.environ.get('HEALTH_STEP_QUEUE'),
+        'questionnaire': os.environ.get('HEALTH_SURVEY_DATA_QUEUE')
     }
     
     # List of folders that should use the default queue
     default_queue_folders = [
         'garmin-device-pulse-ox',
         'garmin-device-respiration',
-        'garmin-device-stress'
+        'garmin-device-stress',
+        'questionnaire'  # Include questionnaire if it should also use default queue
     ]
     
     # Get the queue URL based on folder
