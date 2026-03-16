@@ -6,43 +6,47 @@ from botocore.exceptions import ClientError
 def extract_folder_name(object_key):
     """
     Extracts the folder name from object key
-    Example input: 'Testing-1_cd037752/garmin-device-heart-rate/250204_garmin-device-heart-rate_Testing-1_cd037752.csv'
-    Should return: 'garmin-device-heart-rate'
+    Example: 'Testing-1_cd037752/questionnaire/Physical-Capacity-Aw_6274612c/260122_....csv'
+    Returns: 'questionnaire/Physical-Capacity' if it matches, otherwise just the folder name
     """
     path_segments = object_key.split('/')
-    if len(path_segments) >= 2:  # Ensure we have enough segments
-        return path_segments[1]  # Return the second segment (index 1)
+    if len(path_segments) >= 3:
+        folder = path_segments[1]        # 'questionnaire'
+        subfolder = path_segments[2]     # 'Physical-Capacity-Aw_6274612c'
+        
+        # ✅ Combine folder + subfolder prefix for specific routing
+        if folder == 'questionnaire' and subfolder.startswith('Physical-Capacity'):
+            return 'questionnaire/Physical-Capacity'
+        
+        return folder  # all other folders route as before
+    
+    if len(path_segments) >= 2:
+        return path_segments[1]
+    
     return ''
 
 def get_queue_url_for_folder(folder_name):
-    """
-    Returns the appropriate SQS queue URL based on folder name
-    Uses environment variables that are set by CDK (environment-agnostic)
-    """
     queue_mapping = {
         'garmin-device-heart-rate': os.environ.get('HEALTH_HEART_RATE_QUEUE'),
         'garmin-connect-sleep-stage': os.environ.get('HEALTH_SLEEP_QUEUE'),
         'garmin-device-step': os.environ.get('HEALTH_STEP_QUEUE'),
-        'questionnaire': os.environ.get('HEALTH_SURVEY_DATA_QUEUE')
+        'questionnaire/Physical-Capacity': os.environ.get('HEALTH_SURVEY_DATA_QUEUE')
     }
     
     # List of folders that should use the default queue
     default_queue_folders = [
         'garmin-device-pulse-ox',
         'garmin-device-respiration',
-        'garmin-device-stress',
-        'questionnaire'  # Include questionnaire if it should also use default queue
+        'garmin-device-stress'
     ]
     
-    # Get the queue URL based on folder
     queue_url = queue_mapping.get(folder_name)
     
-    # Use default queue only for specific folders
     if not queue_url and folder_name in default_queue_folders:
         print(f"Using default queue for folder {folder_name}")
         queue_url = os.environ.get('HEALTH_OTHERS_QUEUE')
     
-    return queue_url
+    return queue_url 
 
 def lambda_handler(event, context):
     # Initialize AWS clients

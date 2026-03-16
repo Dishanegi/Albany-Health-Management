@@ -45,7 +45,7 @@ class AlbanyHealthManagementStack(Stack):
             sqs_queues.survey_data_file_queue,
             s3_buckets.source_bucket,
             s3_buckets.processed_bucket,
-            s3_buckets.survey_data_merged_bucket,
+            s3_buckets.survey_data_processing_bucket,
             environment=env_config,
         )
         

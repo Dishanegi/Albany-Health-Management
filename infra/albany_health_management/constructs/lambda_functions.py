@@ -28,7 +28,7 @@ class LambdaFunctions(Construct):
                  survey_data_file_queue,
                  source_bucket, 
                  processed_bucket,
-                 survey_data_merged_bucket, environment: EnvironmentConfig = None, **kwargs) -> None:
+                 survey_data_processing_bucket, environment: EnvironmentConfig = None, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
         # Default to dev environment if not provided
         if environment is None:
@@ -171,7 +171,7 @@ class LambdaFunctions(Construct):
                 pandas_layer_arn
             )],
             environment={
-                "DESTINATION_BUCKET": survey_data_merged_bucket.bucket_name,
+                "DESTINATION_BUCKET": survey_data_processing_bucket.bucket_name,
             }
         )
 
@@ -227,7 +227,7 @@ class LambdaFunctions(Construct):
         processed_bucket.grant_write(self.other_metrics_function)
 
         #Grant write access
-        survey_data_merged_bucket.grant_write(self.survey_data_normalise_function)
+        survey_data_processing_bucket.grant_write(self.survey_data_normalise_function)
         
         # Grant read and write access to the processed_bucket for the data inactivity checker function
         # It needs ListBucket permission to check for batch.json files and read/write them
