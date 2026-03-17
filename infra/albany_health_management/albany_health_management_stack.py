@@ -46,6 +46,7 @@ class AlbanyHealthManagementStack(Stack):
             s3_buckets.source_bucket,
             s3_buckets.processed_bucket,
             s3_buckets.survey_data_processing_bucket,
+            s3_buckets.survey_data_merged_bucket,
             environment=env_config,
         )
         
@@ -69,51 +70,8 @@ class AlbanyHealthManagementStack(Stack):
             "EventBridgeRules",
             lambda_functions.data_inactivity_checker_function,
             glue_workflows,
+            lambda_functions.survey_data_merged_files_function,
             environment=env_config,
-        )        
-        # Add EventBridge rule names and detail-types as environment variables to the data inactivity checker Lambda
-        lambda_functions.data_inactivity_checker_function.add_environment(
-            "EVENTBRIDGE_COMPLETION_RULE_NAME", 
-            event_bridge_rules.completion_rule_name
-        )
-        lambda_functions.data_inactivity_checker_function.add_environment(
-            "EVENTBRIDGE_PROCESSING_RULE_NAME", 
-            event_bridge_rules.processing_rule_name
-        )
-        lambda_functions.data_inactivity_checker_function.add_environment(
-            "EVENTBRIDGE_BUS_NAME", 
-            "default"
-        )
-        lambda_functions.data_inactivity_checker_function.add_environment(
-            "EVENTBRIDGE_GARMIN_DETAIL_TYPE",
-            event_bridge_rules.garmin_detail_type
-        )
-        lambda_functions.data_inactivity_checker_function.add_environment(
-            "EVENTBRIDGE_BBI_DETAIL_TYPE",
-            event_bridge_rules.bbi_detail_type
-        )
-        
-        # Add expected file count environment variables (configurable, defaults to 7)
-        # Sleep-stage is always 1 and not configurable
-        lambda_functions.data_inactivity_checker_function.add_environment(
-            "EXPECTED_STRESS_FILES", 
-            "7"
-        )
-        lambda_functions.data_inactivity_checker_function.add_environment(
-            "EXPECTED_STEP_FILES", 
-            "7"
-        )
-        lambda_functions.data_inactivity_checker_function.add_environment(
-            "EXPECTED_RESPIRATION_FILES", 
-            "7"
-        )
-        lambda_functions.data_inactivity_checker_function.add_environment(
-            "EXPECTED_PULSE_OX_FILES", 
-            "7"
-        )
-        lambda_functions.data_inactivity_checker_function.add_environment(
-            "EXPECTED_HEART_RATE_FILES", 
-            "7"
         )
 
         # Create an IAM role for S3 to send messages to SQS with environment-specific naming

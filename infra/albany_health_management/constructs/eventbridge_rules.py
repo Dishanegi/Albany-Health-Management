@@ -7,7 +7,7 @@ from constructs import Construct
 from ..config import EnvironmentConfig
 
 class EventBridgeRules(Construct):
-    def __init__(self, scope: Construct, construct_id: str, data_inactivity_checker_function, glue_workflows, environment: EnvironmentConfig = None, **kwargs) -> None:
+    def __init__(self, scope: Construct, construct_id: str, data_inactivity_checker_function, glue_workflows, survey_data_merged_files_function, environment: EnvironmentConfig = None, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
         
         # Default to dev environment if not provided
@@ -64,6 +64,8 @@ class EventBridgeRules(Construct):
         # Environment-specific detail-types to ensure events only match this environment's rules
         bbi_detail_type = f"AlbanyHealthGarminBBIWorkflow-{env_suffix}"
         garmin_detail_type = f"AlbanyHealthGarminHealthMetricsWorkflow-{env_suffix}"
+        # Create EventBridge rule to trigger survey data merged files Lambda
+        survey_rule_name = f"trigger-survey-data-merged-files-{env_suffix}"
         
         # Create EventBridge rule for BBI workflow processing
         # The 'name' parameter ensures this exact name is used in AWS
@@ -106,6 +108,30 @@ class EventBridgeRules(Construct):
                 )
             ],
         )
+
+        self.survey_data_merged_files_rule = events.CfnRule(
+            self,
+            f"SurveyDataMergedFilesRule-{env_suffix.capitalize()}",
+            name=survey_rule_name,
+            description=f"Trigger survey_data_merged_files_function on {env_suffix}",
+            state="ENABLED",
+            event_pattern={
+                "source": ["lambda"],
+                "detail-type": [f"AlbanyHealthSurveyDataMergedFiles-{env_suffix}"],
+            },
+            targets=[
+                events.CfnRule.TargetProperty(
+                    arn=survey_data_merged_files_function.function_arn,
+                    id=f"SurveyDataMergedFilesTarget-{env_suffix}",
+                )
+            ],
+        )
+
+        survey_data_merged_files_function.add_permission(
+            f"AllowEventBridgeInvoke-{env_suffix}",
+            principal=iam.ServicePrincipal("events.amazonaws.com"),
+            source_arn=self.survey_data_merged_files_rule.attr_arn,
+        )
         
         # Store rule names and detail-types for Lambda environment variables
         # These are the exact names that will appear in AWS EventBridge console
@@ -113,3 +139,5 @@ class EventBridgeRules(Construct):
         self.processing_rule_name = processing_rule_name
         self.bbi_detail_type = bbi_detail_type
         self.garmin_detail_type = garmin_detail_type
+        self.survey_rule_name = survey_rule_name
+  

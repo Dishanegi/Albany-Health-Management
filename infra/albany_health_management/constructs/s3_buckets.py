@@ -66,3 +66,11 @@ class S3Buckets(Construct):
             auto_delete_objects=True,
             removal_policy=RemovalPolicy.DESTROY,
         )
+
+        self.survey_data_merged_bucket = s3.Bucket(
+            self,
+            "AlbanyHealthSurveyDataMergedBucket",
+            bucket_name=f"albanyhealthsurveydatamerged-s3bucket-{env_suffix}",
+            auto_delete_objects=True,
+            removal_policy=RemovalPolicy.DESTROY
+        )

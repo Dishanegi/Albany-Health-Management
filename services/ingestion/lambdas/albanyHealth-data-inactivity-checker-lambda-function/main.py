@@ -21,12 +21,12 @@ def get_expected_file_counts() -> Dict[str, int]:
     Sleep-stage is always 1, others are configurable via env vars.
     """
     return {
+        'garmin-device-heart-rate': int(os.environ.get('EXPECTED_HEART_RATE_FILES', '7')),
         'garmin-device-stress': int(os.environ.get('EXPECTED_STRESS_FILES', '7')),
         'garmin-device-step': int(os.environ.get('EXPECTED_STEP_FILES', '7')),
         'garmin-device-respiration': int(os.environ.get('EXPECTED_RESPIRATION_FILES', '7')),
         'garmin-device-pulse-ox': int(os.environ.get('EXPECTED_PULSE_OX_FILES', '7')),
-        'garmin-device-heart-rate': int(os.environ.get('EXPECTED_HEART_RATE_FILES', '7')),
-        'garmin-connect-sleep-stage': 1  # Always 1, not configurable
+        'garmin-connect-sleep-stage': 1  # Always 1
     }
 
 # Completion strategy configuration
@@ -49,6 +49,8 @@ def get_eventbridge_config():
         'processing_rule_name': os.environ.get('EVENTBRIDGE_PROCESSING_RULE_NAME', 'trigger-patients-bbi-flow'),
         'garmin_detail_type': os.environ.get('EVENTBRIDGE_GARMIN_DETAIL_TYPE', 'AlbanyHealthGarminHealthMetricsWorkflow'),
         'bbi_detail_type': os.environ.get('EVENTBRIDGE_BBI_DETAIL_TYPE', 'AlbanyHealthGarminBBIWorkflow'),
+        'survey_rule_name': os.environ.get('EVENTBRIDGE_SURVEY_RULE_NAME', 'trigger-survey-data-merged-files'),
+        'survey_detail_type': os.environ.get('EVENTBRIDGE_SURVEY_DETAIL_TYPE', 'AlbanyHealthSurveyDataMergedFiles'),
     }
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
@@ -522,7 +524,6 @@ def update_batch_json_with_race_protection(s3_client, bucket_name: str, batch_in
                 'patient_complete': is_complete,
                 'batch_complete': batch_data['status'] == 'complete',
                 'batch_newly_completed': batch_newly_completed,
-                # ✅ Kept same key name so trigger_batch_complete_events still works
                 'patient_file_counts': {patient_id: batch_data['file_counts']},
                 'batch_json_key': batch_json_key,
                 'event_fingerprint': event_fingerprint,
@@ -716,15 +717,36 @@ def trigger_batch_complete_events(eventbridge_client, bucket_name: str, batch_in
             **base_event_structure
         }
         
-        # Send both events to EventBridge
-        events_to_send = [event_1, event_2]
+        survey_rule_name = eventbridge_config['survey_rule_name']
+        survey_detail_type = eventbridge_config['survey_detail_type']
+
+        event_3 = {
+            'Source': 'lambda',
+            'DetailType': survey_detail_type,
+            'Detail': json.dumps({
+                'batchId': batch_folder,
+                'bucketName': bucket_name,
+                'completedAt': completion_timestamp,
+                'status': 'complete',
+                'metadata': {
+                    'batchFolder': batch_folder,
+                    'lastFileProcessed': f"{batch_info['patient_id']}/{batch_info['file_type']}/{batch_info['filename']}",
+                    'targetRule': survey_rule_name
+                }
+            }),
+            **base_event_structure
+        }
+
+        events_to_send = [event_1, event_2, event_3]
         
         # Log the exact event structure being sent for debugging
         logger.info(f"DEBUG: Sending EventBridge events for batch {batch_folder}")
         logger.info(f"DEBUG: Event 1 structure - Source: {event_1.get('Source')}, DetailType: {event_1.get('DetailType')}, EventBusName: {event_1.get('EventBusName', 'default (omitted)')}")
         logger.info(f"DEBUG: Event 2 structure - Source: {event_2.get('Source')}, DetailType: {event_2.get('DetailType')}, EventBusName: {event_2.get('EventBusName', 'default (omitted)')}")
+        logger.info(f"DEBUG: Event 3 structure - Source: {event_3.get('Source')}, DetailType: {event_3.get('DetailType')}, EventBusName: {event_3.get('EventBusName', 'default (omitted)')}")
         logger.info(f"DEBUG: Expected rule patterns - Rule 1: source=['lambda'], detail-type=['{garmin_detail_type}']")
         logger.info(f"DEBUG: Expected rule patterns - Rule 2: source=['lambda'], detail-type=['{bbi_detail_type}']")
+        logger.info(f"DEBUG: Expected rule patterns - Rule 3: source=['lambda'], detail-type=['{survey_detail_type}']")
         
         response = eventbridge_client.put_events(Entries=events_to_send)
         
@@ -738,9 +760,10 @@ def trigger_batch_complete_events(eventbridge_client, bucket_name: str, batch_in
             logger.error(f"Failed to send {failed_events} events to EventBridge")
             logger.error(f"Failed entries: {response.get('Entries', [])}")
         else:
-            logger.info(f"Successfully sent 2 different events to EventBridge for batch {batch_folder}")
+            logger.info(f"Successfully sent 3 different events to EventBridge for batch {batch_folder}")
             logger.info(f"Event 1: Targeting rule '{completion_rule_name}' with source='lambda', detail-type='{garmin_detail_type}'")
             logger.info(f"Event 2: Targeting rule '{processing_rule_name}' with source='lambda', detail-type='{bbi_detail_type}'")
+            logger.info(f"Event 3: Targeting rule '{survey_rule_name}' with source='lambda', detail-type='{survey_detail_type}'")
             logger.info(f"DEBUG: Check EventBridge console to verify rules are ENABLED and matching these events")
         
         return {
@@ -767,6 +790,14 @@ def trigger_batch_complete_events(eventbridge_client, bucket_name: str, batch_in
                     'batch_id': batch_folder,
                     'purpose': 'Processing trigger',
                     'target_rule': processing_rule_name
+                },
+                {
+                    'event_number': 3,
+                    'source': 'lambda',
+                    'detail_type': survey_detail_type,
+                    'batch_id': batch_folder,
+                    'purpose': 'Survey data merged files trigger',
+                    'target_rule': survey_rule_name
                 }
             ]
         }

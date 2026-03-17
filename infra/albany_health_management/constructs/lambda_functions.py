@@ -28,7 +28,7 @@ class LambdaFunctions(Construct):
                  survey_data_file_queue,
                  source_bucket, 
                  processed_bucket,
-                 survey_data_processing_bucket, environment: EnvironmentConfig = None, **kwargs) -> None:
+                 survey_data_processing_bucket, survey_data_merged_bucket, environment: EnvironmentConfig = None, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
         # Default to dev environment if not provided
         if environment is None:
@@ -152,8 +152,23 @@ class LambdaFunctions(Construct):
             runtime=lambda_.Runtime.PYTHON_3_13,
             handler="main.lambda_handler",
             code=lambda_.Code.from_asset(f"{services_base_path}/albanyHealth-data-inactivity-checker-lambda-function"),
-            timeout=Duration.seconds(300),  # 5 minutes
-            memory_size=512,  # 512 MB - moderate memory for batch processing
+            timeout=Duration.seconds(300),
+            memory_size=512,
+            environment={
+                "EVENTBRIDGE_BUS_NAME": "default",
+                "EVENTBRIDGE_COMPLETION_RULE_NAME": f"trigger-merge-patient-health-metrics-{env_suffix}",
+                "EVENTBRIDGE_PROCESSING_RULE_NAME": f"trigger-patients-bbi-flow-{env_suffix}",
+                "EVENTBRIDGE_GARMIN_DETAIL_TYPE": f"AlbanyHealthGarminHealthMetricsWorkflow-{env_suffix}",
+                "EVENTBRIDGE_BBI_DETAIL_TYPE": f"AlbanyHealthGarminBBIWorkflow-{env_suffix}",
+                "EVENTBRIDGE_SURVEY_RULE_NAME": f"trigger-survey-data-merged-files-{env_suffix}",
+                "EVENTBRIDGE_SURVEY_DETAIL_TYPE": f"AlbanyHealthSurveyDataMergedFiles-{env_suffix}",
+                "EVENTBRIDGE_SOURCE": "lambda",
+                "EXPECTED_HEART_RATE_FILES": "7",
+                "EXPECTED_STRESS_FILES": "7",
+                "EXPECTED_STEP_FILES": "7",
+                "EXPECTED_RESPIRATION_FILES": "7",
+                "EXPECTED_PULSE_OX_FILES": "7",
+            }
         )
 
         self.survey_data_normalise_function = lambda_.Function(
@@ -175,15 +190,24 @@ class LambdaFunctions(Construct):
             }
         )
 
-        # Create an IAM policy statement for the SQSs queue to invoke the function
-        invoke_policy_statement = iam.PolicyStatement(
-            effect=iam.Effect.ALLOW,
-            actions=["lambda:InvokeFunction"],
-            resources=[self.main_router_function.function_arn,
-                       self.heart_rate_function.function_arn,
-                       self.other_metrics_function.function_arn,
-                       self.sleep_function.function_arn,
-                       self.step_function.function_arn]
+        self.survey_data_merged_files_function = lambda_.Function(
+            self,
+            f"AlbanyHealthSurveyDataMergedFilesLambdaFunction{env_suffix.capitalize()}",
+            function_name=f"albanyHealth-survey-data-merged-files-lambda-function-{env_suffix}",
+            runtime=lambda_.Runtime.PYTHON_3_13,
+            handler="main.lambda_handler",
+            code=lambda_.Code.from_asset(f"{services_base_path}/albanyHealth-survey-data-merged-files-lambda-function"),
+            timeout=Duration.seconds(300),  # 5 minutes
+            memory_size=1024,  # 1024 MB - more memory for faster pandas processing
+            layers=[lambda_.LayerVersion.from_layer_version_arn(
+                self,
+                f"SurveyDataMergedFilesPandasLayer-{env_suffix.capitalize()}",
+                pandas_layer_arn
+            )],
+            environment={
+                "DESTINATION_BUCKET": survey_data_merged_bucket.bucket_name,
+                "SOURCE_BUCKET": survey_data_processing_bucket.bucket_name
+            }
         )
 
         # Grant the main router function permission to send messages to the heart rate, others, sleep, and step queues
@@ -211,6 +235,7 @@ class LambdaFunctions(Construct):
         # Grant the inactivity checker function permission to consume messages from the processing files queue
         processing_files_queue.grant_consume_messages(self.data_inactivity_checker_function)
         survey_data_file_queue.grant_consume_messages(self.survey_data_normalise_function)
+        
 
 
         # Grant read access to the source_bucket for the heart rate, step, sleep, other and survey data functions
@@ -219,6 +244,7 @@ class LambdaFunctions(Construct):
         source_bucket.grant_read(self.sleep_function)
         source_bucket.grant_read(self.other_metrics_function)
         source_bucket.grant_read(self.survey_data_normalise_function)
+        
 
         # Grant write access to the processed_bucket for the heart rate, step, sleep, and other functions
         processed_bucket.grant_write(self.heart_rate_function)
@@ -228,6 +254,8 @@ class LambdaFunctions(Construct):
 
         #Grant write access
         survey_data_processing_bucket.grant_write(self.survey_data_normalise_function)
+        survey_data_processing_bucket.grant_read(self.survey_data_merged_files_function)
+        survey_data_merged_bucket.grant_write(self.survey_data_merged_files_function)
         
         # Grant read and write access to the processed_bucket for the data inactivity checker function
         # It needs ListBucket permission to check for batch.json files and read/write them
@@ -327,7 +355,8 @@ class LambdaFunctions(Construct):
             self.data_inactivity_checker_function,
             self.activate_garmin_triggers_lambda,
             self.activate_bbi_triggers_lambda,
-            self.survey_data_normalise_function
+            self.survey_data_normalise_function,
+            self.survey_data_merged_files_function
         ]
         
         for func in lambda_functions:
