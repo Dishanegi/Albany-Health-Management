@@ -7,7 +7,7 @@ from constructs import Construct
 from ..config import EnvironmentConfig
 
 class EventBridgeRules(Construct):
-    def __init__(self, scope: Construct, construct_id: str, data_inactivity_checker_function, glue_workflows, survey_data_merged_files_function, environment: EnvironmentConfig = None, **kwargs) -> None:
+    def __init__(self, scope: Construct, construct_id: str, data_inactivity_checker_function, glue_workflows, survey_data_merged_files_function, survey_data_delete_processing_files_function, environment: EnvironmentConfig = None, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
         
         # Default to dev environment if not provided
@@ -19,6 +19,12 @@ class EventBridgeRules(Construct):
 
         # Allow the data inactivity checker Lambda to publish events that drive the workflows
         data_inactivity_checker_function.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["events:PutEvents"],
+                resources=["*"],
+            )
+        )
+        survey_data_merged_files_function.add_to_role_policy(
             iam.PolicyStatement(
                 actions=["events:PutEvents"],
                 resources=["*"],
@@ -66,6 +72,7 @@ class EventBridgeRules(Construct):
         garmin_detail_type = f"AlbanyHealthGarminHealthMetricsWorkflow-{env_suffix}"
         # Create EventBridge rule to trigger survey data merged files Lambda
         survey_rule_name = f"trigger-survey-data-merged-files-{env_suffix}"
+        survey_delete_rule_name = f"trigger-survey-delete-processing-files-{env_suffix}"
         
         # Create EventBridge rule for BBI workflow processing
         # The 'name' parameter ensures this exact name is used in AWS
@@ -127,12 +134,36 @@ class EventBridgeRules(Construct):
             ],
         )
 
+        self.survey_data_delete_processing_files_rule = events.CfnRule(
+            self,
+            f"SurveyDataDeleteProcessingFilesRule-{env_suffix.capitalize()}",
+            name=survey_delete_rule_name,
+            description=f"Trigger survey_data_delete_processing_files_function on {env_suffix}",
+            state="ENABLED",
+            event_pattern={
+                "source": ["lambda"],
+                "detail-type": [f"AlbanyHealthSurveyDataDeleteProcessingFiles-{env_suffix}"],
+            },
+            targets=[
+                events.CfnRule.TargetProperty(
+                    arn=survey_data_delete_processing_files_function.function_arn,
+                    id=f"SurveyDataDeleteProcessingFilesTarget-{env_suffix}",
+                )
+            ],
+        )
+
         survey_data_merged_files_function.add_permission(
             f"AllowEventBridgeInvoke-{env_suffix}",
             principal=iam.ServicePrincipal("events.amazonaws.com"),
             source_arn=self.survey_data_merged_files_rule.attr_arn,
         )
-        
+
+        survey_data_delete_processing_files_function.add_permission(
+            f"AllowEventBridgeInvoke-{env_suffix}",
+            principal=iam.ServicePrincipal("events.amazonaws.com"),
+            source_arn=self.survey_data_delete_processing_files_rule.attr_arn,
+        )
+
         # Store rule names and detail-types for Lambda environment variables
         # These are the exact names that will appear in AWS EventBridge console
         self.completion_rule_name = completion_rule_name

@@ -47,7 +47,7 @@ class AlbanyHealthManagementStack(Stack):
             s3_buckets.processed_bucket,
             s3_buckets.survey_data_processing_bucket,
             s3_buckets.survey_data_merged_bucket,
-            environment=env_config,
+            environment=env_config
         )
         
 
@@ -71,6 +71,7 @@ class AlbanyHealthManagementStack(Stack):
             lambda_functions.data_inactivity_checker_function,
             glue_workflows,
             lambda_functions.survey_data_merged_files_function,
+            lambda_functions.survey_data_delete_processing_files_function,
             environment=env_config,
         )
 

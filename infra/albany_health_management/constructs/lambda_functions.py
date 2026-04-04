@@ -204,8 +204,24 @@ class LambdaFunctions(Construct):
                 f"SurveyDataMergedFilesPandasLayer-{env_suffix.capitalize()}",
                 pandas_layer_arn
             )],
-            environment={
+            environment= {
                 "DESTINATION_BUCKET": survey_data_merged_bucket.bucket_name,
+                "SOURCE_BUCKET": survey_data_processing_bucket.bucket_name,
+                "EVENTBRIDGE_DELETE_DETAIL_TYPE": f"AlbanyHealthSurveyDataDeleteProcessingFiles-{env_suffix}",
+                "EVENTBRIDGE_BUS_NAME": f"default"
+            }
+        )
+
+        self.survey_data_delete_processing_files_function = lambda_.Function(
+            self,
+            f"AlbanyHealthSurveyDataDeleteProcessingFilesLambdaFunction{env_suffix.capitalize()}",
+            function_name=f"albanyHealth-survey-delete-processing-files{env_suffix}",
+            runtime=lambda_.Runtime.PYTHON_3_13,
+            handler="main.lambda_handler",
+            code=lambda_.Code.from_asset(f"{services_base_path}/albanyHealth-survey-data-delete-processing-files-lambda-function"),
+            timeout=Duration.seconds(300),  # 5 minutes
+            memory_size=1024,  # 1024 MB - more memory for faster pandas processing
+            environment={
                 "SOURCE_BUCKET": survey_data_processing_bucket.bucket_name
             }
         )
@@ -254,8 +270,11 @@ class LambdaFunctions(Construct):
 
         #Grant write access
         survey_data_processing_bucket.grant_write(self.survey_data_normalise_function)
+        survey_data_processing_bucket.grant_read(self.survey_data_delete_processing_files_function)
+        survey_data_processing_bucket.grant_delete(self.survey_data_delete_processing_files_function)
         survey_data_processing_bucket.grant_read(self.survey_data_merged_files_function)
         survey_data_merged_bucket.grant_write(self.survey_data_merged_files_function)
+        survey_data_merged_bucket.grant_read(self.survey_data_merged_files_function)
         
         # Grant read and write access to the processed_bucket for the data inactivity checker function
         # It needs ListBucket permission to check for batch.json files and read/write them
@@ -275,7 +294,7 @@ class LambdaFunctions(Construct):
             retention=logs.RetentionDays.ONE_WEEK,
             removal_policy=RemovalPolicy.DESTROY,
         )
-        
+
         self.activate_garmin_triggers_lambda = lambda_.Function(
             self,
             "ActivateGarminTriggersLambda",
@@ -356,7 +375,8 @@ class LambdaFunctions(Construct):
             self.activate_garmin_triggers_lambda,
             self.activate_bbi_triggers_lambda,
             self.survey_data_normalise_function,
-            self.survey_data_merged_files_function
+            self.survey_data_merged_files_function,
+            self.survey_data_delete_processing_files_function
         ]
         
         for func in lambda_functions:

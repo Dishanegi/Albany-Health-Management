@@ -229,15 +229,16 @@ try:
         # Group files by patient identifier
         patient_files = {}
         for file in files:
-            # Extract patient identifier from path (second folder name)
             path_parts = file.split('/')
             if len(path_parts) >= 2:
-                patient_id = path_parts[1]  # e.g., "Testing-1_cd037752"
-                if patient_id not in patient_files:
-                    patient_files[patient_id] = []
-                patient_files[patient_id].append(file)
-                # Add parent folder for later deletion
-                parent_folders.add(path_parts[0])
+                patient_id = path_parts[0]
+            else:
+                patient_id = 'unknown'
+            
+            if patient_id not in patient_files:
+                patient_files[patient_id] = []
+            patient_files[patient_id].append(file)
+            parent_folders.add(patient_id)
 
         # Process files for each patient
         for patient_id, patient_file_list in patient_files.items():
