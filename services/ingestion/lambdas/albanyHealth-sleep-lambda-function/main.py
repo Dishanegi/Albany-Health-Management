@@ -240,6 +240,7 @@ def lambda_handler(event, context):
     failed_files = []
 
     for record in event['Records']:
+        object_key = None
         try:
             # Parse message body
             message = json.loads(record['body'])
@@ -259,9 +260,11 @@ def lambda_handler(event, context):
 
             # Parse CSV
             df = pd.read_csv(StringIO(file_content), skiprows=6, encoding='utf-8')
+            if df.empty:
+                raise ValueError(f"File contains no data rows after skipping header: {object_key}")
             print(f"Original dataframe: {df.shape[0]} rows, {df.shape[1]} columns")
             print(f"Original columns: {df.columns.tolist()}")
-            
+
             # Process data
             processed_df = process_sleep_data(df, participant_id)
             print(f"Processed dataframe: {processed_df.shape[0]} rows, {processed_df.shape[1]} columns")
@@ -272,21 +275,28 @@ def lambda_handler(event, context):
             processed_df.to_csv(output_buffer, index=False)
 
             # Upload to destination
-            destination_key = object_key
             s3.put_object(
                 Bucket=destination_bucket,
-                Key=destination_key,
+                Key=object_key,
                 Body=output_buffer.getvalue(),
                 ContentType='text/csv'
             )
 
             processed_files.append(object_key)
-            print(f"Successfully processed: {object_key} -> {destination_key}")
+            print(f"Successfully processed: {object_key}")
 
         except Exception as e:
             print(f"Error processing file: {str(e)}")
+            # Write zero-byte placeholder so the inactivity checker can still count this file
+            # and the batch does not stall waiting for a file that will never produce output.
+            if object_key and destination_bucket:
+                try:
+                    s3.put_object(Bucket=destination_bucket, Key=object_key, Body=b"", ContentType='text/csv')
+                    print(f"Wrote empty placeholder for failed file: {object_key}")
+                except Exception as placeholder_err:
+                    print(f"Could not write placeholder for {object_key}: {placeholder_err}")
             failed_files.append({
-                'file': object_key if 'object_key' in locals() else 'unknown',
+                'file': object_key or 'unknown',
                 'error': str(e)
             })
 

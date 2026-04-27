@@ -175,26 +175,44 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
     logger.info("Processing s3://%s/%s", bucket, key)
 
+    out_bucket = OUTPUT_BUCKET or bucket
+
+    # Extract patient_id from source key: {patient_id}/questionnaire/{filename}
+    path_parts = key.split('/')
+    patient_id = path_parts[0] if len(path_parts) >= 1 else 'unknown'
+    filename = key.split('/')[-1]
+    out_key = f"{patient_id}/questionnaire/{filename.rsplit('.', 1)[0]}_cleaned.csv"
+
     # Download
     obj = s3.get_object(Bucket=bucket, Key=key)
     raw_text = _decode_bytes(obj["Body"].read())
 
-    # Clean
-    clean_df = _clean(raw_text)
-
-    # Upload
-    out_bucket = OUTPUT_BUCKET or bucket
-    
-    # Extract the folder name
-    path_parts = key.split('/')
-    if len(path_parts) >= 3:
-        folder_name = path_parts[2]
-    else:
-        folder_name = 'unknown'
-    
-    # Create output key
-    filename = key.split('/')[-1]
-    out_key = f"{folder_name}/{filename.rsplit('.', 1)[0]}_cleaned.csv"    
+    # Attempt to clean. If the file is empty or has no data rows (only headers/labels),
+    # write a zero-byte placeholder so the survey-batch-checker can still count this file
+    # and the batch does not stall waiting for a file that will never produce output.
+    try:
+        clean_df = _clean(raw_text)
+        if clean_df.empty:
+            raise ValueError("File contains no data rows after parsing")
+    except Exception as e:
+        logger.warning(
+            "Skipping unparseable/empty file s3://%s/%s — writing placeholder so batch count is not affected. Reason: %s",
+            bucket, key, e,
+        )
+        s3.put_object(
+            Bucket=out_bucket,
+            Key=out_key,
+            Body=b"",
+            ContentType="text/csv",
+        )
+        return {
+            "statusCode": 200,
+            "input": {"bucket": bucket, "key": key},
+            "output": {"bucket": out_bucket, "key": out_key},
+            "rows_written": 0,
+            "skipped": True,
+            "reason": str(e),
+        }
 
     buf = io.StringIO()
     clean_df.to_csv(buf, index=False)
@@ -213,4 +231,5 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         "input": {"bucket": bucket, "key": key},
         "output": {"bucket": out_bucket, "key": out_key},
         "rows_written": int(len(clean_df)),
+        "skipped": False,
     }

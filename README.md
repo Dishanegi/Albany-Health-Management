@@ -1,406 +1,345 @@
 # Albany Health Management Platform
 
-> **🆕 Multi-Environment Support**: This platform now supports deploying to multiple environments (dev, sandbox, uat, qe, staging, prod) with complete resource isolation. All resources are automatically named with environment-specific suffixes. See [Deployment Section](#deploying-the-system) for details.
-
-## 📋 What This System Does
-
-This platform automatically processes health data from Garmin devices. When new health data files arrive, the system:
-
-1. **Receives** the data files
-2. **Organizes** them by patient and data type 
-3. **Processes** the data to make it usable
-4. **Combines** related data together
-5. **Stores** the final results for analysis
-
-Think of it like a smart filing system that automatically sorts, processes, and organizes health data as it arrives.
+> **Multi-Environment Support**: Supports deploying to multiple environments (dev, sandbox, uat, qe, staging, prod) with complete resource isolation. All resources are automatically named with environment-specific suffixes. See [Deployment Section](#deploying-the-system) for details.
 
 ---
 
-## 🔄 How It Works (Simple Overview)
+## What This System Does
 
-```
-New Health Data Files Arrive
-         ↓
-    System Detects Files
-         ↓
-    Files Are Sorted by Type
-    (Heart Rate, Sleep, Steps, etc.)
-         ↓
-    Data Is Processed & Cleaned 
-         ↓
-    Data Is Combined by Patient
-         ↓  
-    Final Results Are Stored
-```
+This platform automatically processes two categories of data:
 
-### Step-by-Step Process
+1. **Garmin Health Metrics** — heart rate, sleep, step count, stress, respiration, and pulse-ox data from Garmin devices
+2. **Survey / Questionnaire Data** — patient questionnaire responses
 
-1. **Data Arrival**: Health data files are uploaded to a source S3 bucket
-2. **File Detection**: The system automatically detects when new files arrive 
-3. **File Routing**: Files are sorted into different SQS queues based on their type:
-   - Heart Rate data
-   - Sleep data 
-   - Step data
-   - Other health metrics (stress, respiration, pulse-ox)
-4. **Data Processing**: Lambda functions process each file type to:
-   - Clean the data
-   - Format it correctly
-   - Add patient identification 
-5. **Batch Completion Check**: The system waits until all required files for a patient are received
-6. **Data Merging**: Once complete, Glue jobs combine and organize the data
-7. **Final Storage**: Processed data is stored in S3 buckets for analysis
+Both pipelines ingest raw files, clean and normalize them, track batch completion using DynamoDB, and trigger downstream Glue jobs or merge operations once all expected files for a patient have arrived.
 
 ---
 
-## 🏗️ System Components (What Each Part Does)
+## Pipelines Overview
 
-### 📦 Storage Buckets (S3)
-**What they do**: Store health data files at different stages of processing
+### Garmin Health Metrics Pipeline
 
-- **Source Bucket**: Where new data files first arrive
-- **Processed Bucket**: Where cleaned and organized data is stored
-- **Merged Bucket**: Where final combined data is stored
-- **BBI Processing Bucket**: Stores BBI (Beat-to-Beat Interval) data during processing
-- **BBI Merged Bucket**: Final storage for processed BBI data
+```
+Source bucket: albanyhealthsource-s3bucket-{env}
+  {patient_id}/{data_type}/{filename}.csv
+         ↓  S3 event → Main SQS
+  main-router lambda  (routes by data type)
+         ↓  type-specific SQS queues
+  heart-rate / sleep / step / other-metrics lambdas
+  (clean & reformat, write to processed bucket)
+  If empty/invalid → writes zero-byte placeholder so batch is not stalled
+         ↓  S3 event on processed bucket → processing-files SQS
+  data-inactivity-checker lambda
+  (atomically counts files in DynamoDB; expected count read from source bucket)
+         ↓  when actual == expected for all data types
+  EventBridge → Garmin Health Metrics Glue Workflow
+              → BBI Glue Workflow
+```
 
-### 📨 Message Queues (SQS) 
-**What they do**: Act like waiting lines for files to be processed
+### Survey Data Pipeline
 
-- Files wait in queues until a Lambda function is ready to process them
-- Different queues for different types of data (heart rate, sleep, steps, etc.)
-- Ensures files are processed in order and nothing gets lost
+```
+Source bucket: albanyhealthsource-s3bucket-{env}
+  {patient_id}/questionnaire/{form_filename}
+         ↓  S3 event → Main SQS → survey-data-file SQS
+  survey-data-normalise lambda
+  (cleans CSV, extracts patient_id, writes to processing bucket)
+  If empty/invalid → writes zero-byte placeholder so batch is not stalled
+         ↓  written to: albanyhealthsurveydataprocessing-s3bucket-{env}
+              {patient_id}/questionnaire/{form_filename}_cleaned.csv
+         ↓  S3 event → survey-processing-files SQS
+  survey-batch-checker lambda
+  (atomically counts files in DynamoDB; expected count read from source bucket)
+         ↓  when actual == expected
+  EventBridge → survey-data-merged-files lambda
+  (reads all cleaned CSVs per patient, merges into one file)
+         ↓  written to: albanyhealthsurveydatamerged-s3bucket-{env}
+  EventBridge → survey-data-delete-processing-files lambda
+  (cleans up processing bucket after merge)
+```
 
-### ⚙️ Processing Workers (Lambda Functions)
-**What they do**: Process the data files
+---
 
-- **Main Router**: Decides which queue each file should go to
-- **Heart Rate Processor**: Processes heart rate data
-- **Sleep Processor**: Processes sleep data 
-- **Step Processor**: Processes step data
-- **Other Metrics Processor**: Processes stress, respiration, and pulse-ox data
-- **Batch Checker**: Monitors when all files for a patient are received 
-- **Garmin Triggers Activator**: Automatically activates Glue workflow triggers for Garmin data processing
-- **BBI Triggers Activator**: Automatically activates Glue workflow triggers for BBI data processing
+## System Components
 
-### 🔄 Data Processing Jobs (Glue Jobs)
-**What they do**: Perform heavy-duty data processing and combining
+### Storage Buckets (S3)
+
+| Bucket | Purpose |
+|--------|---------|
+| `albanyhealthsource-s3bucket-{env}` | Raw incoming files (Garmin + survey) |
+| `albanyhealthprocessed-s3bucket-{env}` | Cleaned Garmin metric files |
+| `albanyhealthmerged-s3bucket-{env}` | Final merged Garmin data |
+| `albanyhealthbbiprocessing-s3bucket-{env}` | BBI data during processing |
+| `albanyhealthbbimerged-s3bucket-{env}` | Final merged BBI data |
+| `albanyhealthsurveydataprocessing-s3bucket-{env}` | Normalized survey files awaiting merge |
+| `albanyhealthsurveydatamerged-s3bucket-{env}` | Final merged survey data |
+
+All buckets have `RemovalPolicy.DESTROY` and `auto_delete_objects=True` so they are fully cleaned up on `cdk destroy`.
+
+### Message Queues (SQS)
+
+Each queue has a paired Dead-Letter Queue (DLQ) retaining failed messages for 14 days.
+
+| Queue | Trigger |
+|-------|---------|
+| `AlbanyHealthMain-SQSQueue-{ENV}` | Source bucket → main router |
+| `AlbanyHealthHeartRate-SQSQueue-{ENV}` | Heart rate files |
+| `AlbanyHealthSleep-SQSQueue-{ENV}` | Sleep files |
+| `AlbanyHealthStep-SQSQueue-{ENV}` | Step files |
+| `AlbanyHealthOthers-SQSQueue-{ENV}` | Stress / respiration / pulse-ox files |
+| `AlbanyHealthSuccessfullProcessingFiles-SQSQueue-{ENV}` | Processed bucket → inactivity checker |
+| `AlbanyHealthSurveyDataProcessingFile-SQSQueue-{ENV}` | Survey files → normalise lambda |
+| `AlbanyHealthSurveyProcessingFiles-SQSQueue-{ENV}` | Survey processing bucket → batch checker |
+
+### Lambda Functions
+
+| Function | Purpose |
+|----------|---------|
+| `albanyHealth-main-router-lambda-function-{env}` | Routes incoming files to the correct SQS queue based on data type |
+| `albanyHealth-heart-rate-lambda-function-{env}` | Cleans and reformats heart rate CSV files |
+| `albanyHealth-sleep-lambda-function-{env}` | Cleans sleep data; expands to minute-by-minute records |
+| `albanyHealth-step-lambda-function-{env}` | Cleans step data; deduplicates rows |
+| `albanyHealth-other-metrics-lambda-function-{env}` | Cleans stress, respiration, and pulse-ox data |
+| `albanyHealth-data-inactivity-checker-lambda-function-{env}` | Tracks Garmin batch completion in DynamoDB; triggers EventBridge when all files arrive |
+| `albanyHealth-survey-data-normalise-lambda-function-{env}` | Cleans survey CSVs; extracts patient ID from preamble; writes to processing bucket |
+| `albanyHealth-survey-batch-checker-lambda-function-{env}` | Tracks survey batch completion in DynamoDB; triggers EventBridge when all questionnaire files are processed |
+| `albanyHealth-survey-data-merged-files-lambda-function-{env}` | Merges all cleaned survey CSVs per patient into a single file |
+| `albanyHealth-survey-data-delete-processing-files-lambda-function-{env}` | Deletes normalized survey files from the processing bucket after merge |
+| `albanyHealth-activate-garmin-triggers-lambda-function-{env}` | Activates Garmin Glue workflow conditional triggers after deployment |
+| `albanyHealth-activate-bbi-triggers-lambda-function-{env}` | Activates BBI Glue workflow conditional triggers after deployment |
+
+All Lambda functions have explicit CloudWatch Log Groups created as CDK resources with `RemovalPolicy.DESTROY` and 1-week log retention. This ensures log groups are fully deleted on `cdk destroy`.
+
+### DynamoDB Tables
+
+| Table | Purpose | Partition Key |
+|-------|---------|---------------|
+| `AlbanyHealthBatchTracking-{env}` | Tracks Garmin file counts per patient per day | `patient_id` (e.g. `Testing-1_cd037752#2025-04-27`) |
+| `AlbanyHealthSurveyBatchTracking-{env}` | Tracks survey questionnaire file counts per patient per day | `patient_id` (e.g. `Testing-1_cd037752#2025-04-27`) |
+
+Both tables use `RemovalPolicy.DESTROY` and pay-per-request billing.
+
+**How batch tracking works:**
+
+- Each file arrival triggers an atomic `UpdateItem` with `ADD counter :1` and `ADD processed_files :file_id`
+- A `ConditionExpression: NOT contains(processed_files, :file_id)` prevents double-counting (deduplication)
+- The expected count per file type is read from the source bucket on first arrival and stored with `if_not_exists` — subsequent files skip the S3 list call
+- Once actual count ≥ expected count, a second conditional write claims the trigger role (`status: processing → complete`), ensuring exactly one Lambda fires the EventBridge event even under concurrent execution
+
+### Glue Jobs
 
 **Garmin Health Metrics Flow**:
-1. **Preprocessor**: Prepares data for processing  
-2. **Merger**: Combines data from multiple files
-3. **Cleaner**: Removes temporary files after processing
+1. `AlbanyHealthGarmin-Data-Preprocessor-Glue-Job-{env}` — reads per patient/data-type folders from the processed bucket; supports multiple files per folder (including multiple sleep files)
+2. `AlbanyHealthGarmin-Data-Merge-Glue-Job-{env}` — merges preprocessed data into patient-level files
+3. `AlbanyHealthGarmin-Data-Delete-Glue-Job-{env}` — removes intermediate files after merge
 
-**BBI (Beat-to-Beat Interval) Flow**: 
-1. **Preprocessor**: Prepares BBI data for analysis
-2. **Merger**: Combines BBI data
-3. **Cleaner**: Removes temporary files after processing
+**BBI Flow**:
+1. `AlbanyHealthGarmin-BBI-Preprocessor-Glue-Job-{env}`
+2. `AlbanyHealthGarmin-BBI-Merge-Data-Glue-Job-{env}`
+3. `AlbanyHealthGarmin-BBI-Delete-Data-Glue-Job-{env}`
+4. `AlbanyHealthGarmin-BBI-Delete-Source-Folders-Glue-Job-{env}`
 
-### 🎯 Workflow Orchestrator (Glue Workflows)
-**What they do**: Ensure jobs run in the correct order
+### EventBridge Rules
 
-- Makes sure the preprocessor runs before the merger
-- Makes sure the merger runs before the cleaner 
-- Automatically starts the next job when the previous one finishes
-
-### 📡 Event System (EventBridge)
-**What they do**: Send notifications when important events happen
-
-- Notifies the system when a batch of files is complete
-- Triggers the data processing workflows automatically
+| Rule | Fired by | Triggers |
+|------|----------|---------|
+| `trigger-merge-patient-health-metrics-{env}` | inactivity-checker (Garmin batch complete) | Garmin Health Metrics Glue Workflow |
+| `trigger-patients-bbi-flow-{env}` | inactivity-checker (BBI batch complete) | BBI Glue Workflow |
+| `trigger-survey-data-merged-files-{env}` | survey-batch-checker (survey batch complete) | survey-data-merged-files lambda |
+| `trigger-survey-delete-processing-files-{env}` | survey-data-merged-files (merge complete) | survey-data-delete-processing-files lambda |
 
 ---
 
-## 🚀 Getting Started (For Developers) 
+## S3 File Path Formats
+
+### Garmin Health Metrics
+```
+Source:    {patient_id}/{data_type}/{filename}.csv
+           e.g. Testing-1_cd037752/garmin-device-heart-rate/250204_heartrate_Testing-1_cd037752.csv
+
+Processed: {patient_id}/{data_type}/{filename}.csv  (same key, different bucket)
+```
+
+Supported `data_type` values: `garmin-device-heart-rate`, `garmin-device-stress`, `garmin-device-step`, `garmin-device-respiration`, `garmin-device-pulse-ox`, `garmin-connect-sleep-stage`
+
+### Survey / Questionnaire
+```
+Source:     {patient_id}/questionnaire/{form_filename}
+            e.g. Testing-1_cd037752/questionnaire/Physical-Capacity-Aw_6274612c
+
+Processing: {patient_id}/questionnaire/{form_filename}_cleaned.csv
+            e.g. Testing-1_cd037752/questionnaire/Physical-Capacity-Aw_6274612c_cleaned.csv
+
+Merged:     {patient_id}/{earliest_date}_merged.csv
+            e.g. Testing-1_cd037752/20260101_merged.csv
+```
+
+---
+
+## Empty / Invalid File Handling
+
+Some source files contain only header rows or labels with no actual data. This would cause processing lambdas to throw `No columns to parse from file` and write nothing to the destination bucket, stalling the batch indefinitely.
+
+**All processing lambdas** (heart rate, sleep, step, other metrics, survey normalise) now handle this by:
+1. Detecting empty DataFrames or parse errors
+2. Writing a **zero-byte placeholder** file at the same destination key
+3. Logging a warning instead of failing
+
+The batch checker counts the placeholder file normally, so the batch still completes. The Glue preprocessing scripts and survey merge lambda skip zero-byte files when reading back.
+
+---
+
+## Getting Started
 
 ### Prerequisites
 - Python 3.13 or higher
 - AWS Account with appropriate permissions
-- AWS CDK installed 
+- AWS CDK installed
 
 ### Initial Setup
 
-1. **Navigate to the infrastructure folder**:
-   ```bash
-   cd infra
-   ```
-
-2. **Create a virtual environment** (isolated Python environment):
-   ```bash  
-   python3 -m venv .venv
-   ```
-
-3. **Activate the virtual environment**:
-   - **Mac/Linux**: `source .venv/bin/activate`
-   - **Windows**: `.venv\Scripts\activate.bat`
-
-4. **Install required packages**:
-   ```bash
-   pip install -r requirements.txt
-   ```
+```bash
+cd infra
+python3 -m venv .venv
+source .venv/bin/activate        # Mac/Linux
+# .venv\Scripts\activate.bat     # Windows
+pip install -r requirements.txt
+```
 
 ### Deploying the System
 
-#### Multi-Environment Support
+```bash
+# First-time setup (once per AWS account/region)
+cdk bootstrap
 
-This system supports deploying to multiple environments. All resources are automatically named with environment-specific suffixes to ensure complete isolation between environments.
+# Preview changes
+cdk diff --context env=dev
 
-**Available Environments:**
-- `dev` - Development environment (default)
-- `sandbox` - Sandbox environment for testing
-- `sandox` - Sandox environment
-- `uat` - User Acceptance Testing environment
-- `qe` - Quality Engineering environment
-- `staging` - Staging environment
-- `prod` - Production environment
+# Deploy
+cdk deploy --context env=dev       # Development (default)
+cdk deploy --context env=sandbox   # Sandbox
+cdk deploy --context env=staging   # Staging
+cdk deploy --context env=prod      # Production
 
-#### Deployment Steps
+# Deploy with explicit account and region
+cdk deploy --context env=staging --context account=123456789012 --context region=us-east-1
 
-1. **First-time setup** (only needed once per AWS account/region):
-   ```bash
-   cdk bootstrap
-   ```
+# Destroy (removes all resources including log groups)
+cdk destroy --context env=dev
+```
 
-2. **Preview changes** (see what will be created/updated):
-   ```bash  
-   cdk diff --context env=dev
-   ```
-
-3. **Deploy to a specific environment**:
-   ```bash
-   # Deploy to development (default)
-   cdk deploy
-   # or explicitly:
-   cdk deploy --context env=dev
-   
-   # Deploy to staging
-   cdk deploy --context env=staging
-   
-   # Deploy to production
-   cdk deploy --context env=prod
-   
-   # Deploy to UAT
-   cdk deploy --context env=uat
-   ```
-
-4. **Deploy with specific AWS account and region**:
-   ```bash
-   cdk deploy --context env=staging --context account=123456789012 --context region=us-west-2
-   ```
-
-5. **Remove the system** (when you want to delete everything):
-   ```bash
-   cdk destroy --context env=dev
-   ```
-
-#### Environment-Specific Resource Naming
-
-All resources are automatically named with the environment suffix to ensure complete isolation:
-
-- **S3 Buckets**: `albanyhealthsource-s3bucket-{env}`, `albanyhealthprocessed-s3bucket-{env}`, etc.
-- **Lambda Functions**: `albanyHealth-main-router-lambda-function-{env}`, etc.
-- **SQS Queues**: `AlbanyHealthMain-SQSQueue-{ENV}`, `AlbanyHealthMain-DLQ-{ENV}`, etc.
-- **Glue Jobs**: `AlbanyHealthGarmin-Data-Preprocessor-Glue-Job-{env}`, etc.
-- **Glue Workflows**: `AlbanyHealthGarminHealthMetricsWorkflow-{env}`, etc.
-- **EventBridge Rules**: `trigger-merge-patient-health-metrics-{env}`, etc.
-- **IAM Roles**: `AlbanyHealthGlueJobRole-{env}`, `AlbanyHealthS3ToSQSRole-{env}`, etc.
-- **Stack Name**: `AlbanyHealthManagementStack-{env}`
-
-#### Resource Tags
-
-All resources are automatically tagged with:
-- `Environment`: The environment name (dev/sandbox/uat/qe/staging/prod)
-- `Project`: AlbanyHealthManagement
-
-This allows you to:
-- Filter resources by environment in AWS Console
-- Apply environment-specific policies
-- Track costs per environment
-- Deploy multiple environments in the same AWS account
-
-> **Note**: For detailed deployment instructions and troubleshooting, see `infra/DEPLOYMENT.md`
-
-### Development Commands
-
-- `cdk synth --context env=dev` - Generate the deployment template for a specific environment
-- `cdk ls` - List all stacks in the project
-- `cdk diff --context env=dev` - Preview changes before deploying
-- `cdk watch --context env=dev` - Automatically redeploy when code changes
-- `pytest tests` - Run automated tests
-
-### Environment Configuration
-
-Environment configurations are managed in `infra/albany_health_management/config.py`. Each environment can have:
-- Custom AWS account and region settings
-- Environment-specific resource configurations
-- Custom feature flags or settings
-
-To add a new environment or modify existing ones, edit the `ENVIRONMENTS` dictionary in `config.py`.
+**Available environments**: `dev`, `sandbox`, `sandox`, `uat`, `qe`, `staging`, `prod`
 
 ---
 
-## 📁 Project Structure
+## Project Structure
 
 ```
 Albany-Health-Management/
 │
-├── 📂 infra/                         # Infrastructure code (how the system is built)
-│   ├── app.py                        # Main application entry point
-│   ├── cdk.json                      # CDK configuration
-│   ├── DEPLOYMENT.md                 # Multi-environment deployment guide
-│   └── albany_health_management/     
-│       ├── config.py                 # Environment configuration
-│       ├── albany_health_management_stack.py  # Main system definition
-│       └── constructs/               # Individual components
-│           ├── s3_buckets.py         # Storage bucket definitions 
-│           ├── sqs_queues.py         # Message queue definitions
-│           ├── lambda_functions.py   # Processing worker definitions
-│           ├── glue_jobs.py          # Data processing job definitions
-│           ├── glue_workflows.py     # Workflow orchestrator definitions
-│           └── eventbridge_rules.py  # Event notification rules
-│  
-├── 📂 services/                      # Application code (what the system does)
-│   ├── ingestion/                    # Data intake services
-│   │   └── lambdas/                  # Processing workers   
-│   │       ├── albanyHealth-main-router-lambda-function/         # Routes files to correct queue
-│   │       ├── albanyHealth-heart-rate-lambda-function/          # Processes heart rate data
-│   │       ├── albanyHealth-sleep-lambda-function/               # Processes sleep data
-│   │       ├── albanyHealth-step-lambda-function/                # Processes step data  
-│   │       ├── albanyHealth-other-metrics-lambda-function/       # Processes other health metrics
-│   │       ├── albanyHealth-data-inactivity-checker-lambda-function/      # Monitors batch completion
-│   │       ├── albanyHealth-activate-garmin-triggers-lambda-function/     # Activates Garmin workflow triggers
-│   │       └── albanyHealth-activate-bbi-triggers-lambda-function/        # Activates BBI workflow triggers
-│   │   
-│   └── analytics/                    # Data processing services
-│       └── glue_jobs/                # Heavy-duty data processing scripts  
-│           ├── AlbanyHealth-Garmin-Health-metrics-Flow-Script/  # Health metrics processing
-│           └── AlbanyHealth-BBI-Flow-Script/            # BBI data processing
+├── infra/
+│   ├── app.py
+│   ├── cdk.json
+│   ├── DEPLOYMENT.md
+│   └── albany_health_management/
+│       ├── config.py
+│       ├── albany_health_management_stack.py
+│       └── constructs/
+│           ├── s3_buckets.py         — 7 S3 buckets (Garmin + Survey)
+│           ├── sqs_queues.py         — 8 SQS queues + DLQs
+│           ├── dynamodb_table.py     — Batch tracking tables (Garmin + Survey)
+│           ├── lambda_functions.py   — 12 Lambda functions with explicit log groups
+│           ├── glue_jobs.py          — 7 Glue jobs
+│           ├── glue_workflows.py     — Garmin + BBI Glue workflows
+│           └── eventbridge_rules.py  — 4 EventBridge rules
 │
-├── 📂 docs/                           # Documentation and guides
-├── 📂 tests/                          # Automated tests  
-└── 📂 tools/                          # Helper scripts
+└── services/
+    ├── ingestion/
+    │   └── lambdas/
+    │       ├── albanyHealth-main-router-lambda-function/
+    │       ├── albanyHealth-heart-rate-lambda-function/
+    │       ├── albanyHealth-sleep-lambda-function/
+    │       ├── albanyHealth-step-lambda-function/
+    │       ├── albanyHealth-other-metrics-lambda-function/
+    │       ├── albanyHealth-data-inactivity-checker-lambda-function/
+    │       ├── albanyHealth-survey-data-normalise-lambda-function/
+    │       ├── albanyHealth-survey-batch-checker-lambda-function/
+    │       ├── albanyHealth-survey-data-merged-files-lambda-function/
+    │       ├── albanyHealth-survey-data-delete-processing-files-lambda-function/
+    │       ├── albanyHealth-activate-garmin-triggers-lambda-function/
+    │       └── albanyHealth-activate-bbi-triggers-lambda-function/
+    └── analytics/
+        └── glue_jobs/
+            ├── AlbanyHealth-Garmin-Health-metrics-Flow-Script/
+            └── AlbanyHealth-BBI-Flow-Script/
 ```
 
---- 
+---
 
-## 🔍 Monitoring & Troubleshooting
+## Monitoring & Troubleshooting
 
-### Where to Check System Status
+### Where to Check
 
-1. **AWS CloudWatch Console**: 
-   - View logs from all Lambda functions (log groups are environment-specific)
-   - See error messages if something goes wrong
-   - Monitor system performance
-   - Filter by environment using tags
-
-2. **AWS Glue Console**:
-   - Check if data processing jobs are running (jobs are named with environment suffix)
-   - See job execution history  
-   - View job success/failure status
-   - Workflows are named: `AlbanyHealthGarminHealthMetricsWorkflow-{env}`
-
-3. **AWS S3 Console**:
-   - Verify files are arriving in the source bucket (buckets are environment-specific)
-   - Check if processed files are being created
-   - Monitor storage usage
-   - Bucket names: `albanyhealthsource-s3bucket-{env}`, etc.
-
-4. **AWS CloudFormation Console**:
-   - View stack status: `AlbanyHealthManagementStack-{env}`
-   - Check resource creation status
-   - View stack events and errors 
+| Console | What to check |
+|---------|--------------|
+| **CloudWatch Logs** | Lambda function logs — each function has its own log group `/aws/lambda/{function-name}-{env}` |
+| **DynamoDB** | `AlbanyHealthBatchTracking-{env}` and `AlbanyHealthSurveyBatchTracking-{env}` — check `questionnaire_count`, `expected_questionnaire_count`, `status` |
+| **SQS** | Queue depth — messages stuck in DLQ indicate repeated Lambda failures |
+| **Glue** | Job run history under `AlbanyHealthGarminHealthMetricsWorkflow-{env}` |
+| **S3** | Source bucket for incoming files; processing bucket for survey normalized files |
 
 ### Common Issues
 
-**Problem**: Files are not being processed
-- **Check**: Are files arriving in the correct environment's source S3 bucket? (e.g., `albanyhealthsource-s3bucket-{env}`)
-- **Check**: Are there any error messages in CloudWatch logs for the specific environment?
-- **Check**: Are the SQS queues empty or backed up? (Queue names include environment: `AlbanyHealthMain-SQSQueue-{ENV}`)
-- **Check**: Are you looking at the correct environment's resources?
+**Batch never triggers (EventBridge never fires)**
+- Check DynamoDB item for the patient: actual count should equal expected count
+- If expected count is 0, the source bucket count returned 0 — verify the source bucket path matches `{patient_id}/{data_type}/` for Garmin or `{patient_id}/questionnaire/` for survey
+- If some files are empty/label-only, check that placeholder files were written to the processed/processing bucket (look for 0-byte files in the destination bucket)
 
-**Problem**: Data processing jobs are failing
-- **Check**: CloudWatch logs for the specific Glue job (jobs are named with environment suffix)
-- **Check**: Are there permission errors? 
-- **Check**: Is the data format correct?
-- **Check**: Verify you're checking the correct environment's Glue jobs
+**"No columns to parse from file" in logs**
+- Expected — the lambda detected an empty/headers-only source file
+- A zero-byte placeholder should have been written to the destination bucket
+- The batch will still complete once all files (including placeholders) are counted
 
-**Problem**: System is slow
-- **Check**: How many files are waiting in SQS queues? (Use environment-specific queue names)
-- **Check**: Are the Lambda functions running? (Function names include environment suffix)
-- **Check**: Are there any error messages?
-- **Check**: Verify you're monitoring the correct environment
+**Survey batch checker: "does not match survey pattern"**
+- The file key in the processing bucket does not follow `{patient_id}/questionnaire/{filename}` format
+- Check the survey-data-normalise lambda is writing with the correct path structure
+- Verify the source file was under `{patient_id}/questionnaire/` in the source bucket
 
-**Problem**: Deployment fails with "ResourceExistenceCheck Failed"
-- **Check**: S3 bucket names are globally unique - ensure bucket names don't already exist
-- **Check**: Verify account and region are correctly configured
-- **Check**: See `infra/DEPLOYMENT.md` for detailed troubleshooting steps
+**Files not processed after `cdk destroy` + redeploy**
+- DynamoDB items from a previous batch may persist if they were not cleaned up
+- The tables are destroyed with `cdk destroy` — this is expected behaviour
 
 ---
 
-## ⚙️ System Configuration
+## Resource Cleanup (cdk destroy)
 
-### Current Settings
+All resources are configured to be fully deleted on `cdk destroy`:
 
-- **Lambda Capacity**: 10 concurrent executions per function (for faster processing) 
-- **Glue Worker Type**: G.1X (4 vCPU, 16 GB memory per worker)
-- **Permissions**: Least privilege IAM roles (for security best practices)
-- **Log Retention**: 
-  - Lambda function logs: Automatically managed by CDK (environment-specific log groups)
-  - Explicit log groups: 7 days retention
-  - All logs are environment-specific and isolated
-
-### Multi-Environment Architecture
-
-- **Complete Resource Isolation**: Each environment has its own set of resources with unique names
-- **Environment-Specific Naming**: All resources include the environment suffix
-- **Automatic Tagging**: All resources are tagged with environment and project name
-- **Stack Isolation**: Each environment deploys as a separate CloudFormation stack
-- **IAM Role Isolation**: Each environment has its own IAM roles for security
-
-### Data Processing Requirements
-
-The system expects the following files per patient batch:
-- **Stress files**: 7 files 
-- **Step files**: 7 files
-- **Respiration files**: 7 files 
-- **Pulse-ox files**: 7 files
-- **Heart rate files**: 7 files 
-- **Sleep-stage files**: 1 file (always)
-
-Once all required files are received, the batch is automatically processed.
+| Resource type | Cleanup mechanism |
+|---------------|------------------|
+| S3 buckets | `RemovalPolicy.DESTROY` + `auto_delete_objects=True` |
+| DynamoDB tables | `RemovalPolicy.DESTROY` |
+| Lambda functions | `RemovalPolicy.DESTROY` |
+| Lambda log groups | Explicit `logs.LogGroup` with `RemovalPolicy.DESTROY` (1-week retention) |
+| SQS queues + DLQs | CDK v2 default (DESTROY) |
+| Glue jobs | CloudFormation default (DELETE) |
+| EventBridge rules / IAM roles | CloudFormation default (DELETE) |
 
 ---
 
-## 📞 Support & Questions
-
-If you encounter issues or have questions:
-
-1. Check the CloudWatch logs for error messages
-2. Review the system status in AWS Console
-3. Check this README for common troubleshooting steps
-4. Contact the development team with specific error messages
-
----
-
-## 🔐 Security Notes
+## Security Notes
 
 - **Environment Isolation**: Each environment has separate IAM roles and resources
-- **IAM Roles**: Environment-specific roles (e.g., `AlbanyHealthGlueJobRole-{env}`)
-- **Data Storage**: All data is stored securely in AWS S3 buckets with environment-specific names
-- **Access Control**: Access is controlled through AWS IAM roles per environment
-- **Log Retention**: 
-  - Lambda logs: Automatically managed, environment-specific
-  - Explicit log groups: 7 days retention
-- **Resource Tagging**: All resources are tagged for security and compliance tracking
-- **Multi-Account Support**: Can deploy different environments to different AWS accounts for enhanced security
-
+- **Least Privilege**: Lambda functions are granted only the specific S3/DynamoDB/SQS/EventBridge permissions they need
+- **DynamoDB Atomic Operations**: Batch counting uses conditional writes to prevent race conditions under concurrent Lambda execution
+- **Log Retention**: All Lambda log groups retain logs for 1 week and are deleted on stack destroy
+- **Multi-Account Support**: Can deploy different environments to different AWS accounts
 
 ---
 
-## 📝 Version Information
+## Version Information
 
 - **CDK Version**: 2.x
 - **Python Version**: 3.13+
-- **Glue Version**: 5.0  
-- **Lambda Runtime**: Python 3.13
-
----
+- **Glue Version**: 5.0
+- **Lambda Runtime**: Python 3.13 (Python 3.11 for trigger-activator functions)

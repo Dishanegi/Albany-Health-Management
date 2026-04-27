@@ -9,7 +9,8 @@ from awsglue.context import GlueContext
 from awsglue.job import Job
 from pyspark.sql.functions import col, split
 
-# Initialize error logging
+# ── Logging helpers ──────────────────────────────────────────────────────────
+
 def log_error(message, error_details=None):
     """Log errors to S3 for debugging"""
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -17,9 +18,7 @@ def log_error(message, error_details=None):
     if error_details:
         log_message += f"Details: {error_details}\n"
         log_message += f"Traceback: {traceback.format_exc()}\n"
-
     log_key = f"error_logs/error_log_{timestamp}.txt"
-
     try:
         s3_client = boto3.client("s3")
         s3_client.put_object(Bucket=source_bucket_name, Key=log_key, Body=log_message)
@@ -27,36 +26,153 @@ def log_error(message, error_details=None):
     except Exception as e:
         print(f"Failed to write error log: {str(e)}")
 
-# Simple info logging to console instead of S3
+
 def log_info(message):
     """Log information to console"""
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     print(f"[{timestamp}] INFO: {message}")
 
-def delete_folder(s3_client, bucket, folder_path):
-    """Delete all objects in a folder and the folder itself"""
+
+# ── S3 helpers ───────────────────────────────────────────────────────────────
+
+def list_csv_files_in_folder(s3_client, bucket, prefix):
+    """
+    Return every .csv key under bucket/prefix using pagination.
+    Works correctly whether the folder contains 1 file or many.
+    """
+    keys = []
+    paginator = s3_client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            if obj["Key"].endswith(".csv"):
+                keys.append(obj["Key"])
+    return keys
+
+
+def delete_folder(s3_client, bucket, folder_prefix):
+    """Delete all objects under folder_prefix."""
     try:
-        # List all objects in the folder
-        response = s3_client.list_objects_v2(
-            Bucket=bucket,
-            Prefix=folder_path
-        )
-        
-        if "Contents" in response:
-            # Delete all objects in the folder
-            for obj in response["Contents"]:
-                s3_client.delete_object(
-                    Bucket=bucket,
-                    Key=obj["Key"]
-                )
-            log_info(f"Successfully deleted folder: {folder_path}")
-        else:
-            log_info(f"No objects found in folder: {folder_path}")
+        paginator = s3_client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=bucket, Prefix=folder_prefix):
+            for obj in page.get("Contents", []):
+                s3_client.delete_object(Bucket=bucket, Key=obj["Key"])
+        log_info(f"Deleted folder: {folder_prefix}")
     except Exception as e:
-        log_error(f"Error deleting folder {folder_path}", str(e))
+        log_error(f"Error deleting folder {folder_prefix}", str(e))
+
+
+# ── Data type registry ────────────────────────────────────────────────────────
+# Every entry here is treated identically: all CSV files found in
+# {patient_id}/{DATA_TYPE}/ are stacked (unioned) into one output file.
+# Sleep intentionally appears here — it supports multiple files per patient
+# exactly like heart-rate, step, etc.
+
+ALL_DATA_TYPES = [
+    "garmin-device-heart-rate",
+    "garmin-connect-sleep-stage",   # ← supports 1..N files per patient
+    "garmin-device-step",
+    "garmin-device-respiration",
+    "garmin-device-stress",
+    "garmin-device-pulse-ox",
+]
+
+
+# ── Spark processing ──────────────────────────────────────────────────────────
+
+def process_files_by_type(glue_context, s3_bucket, file_keys, data_type_label):
+    """
+    Read every CSV file in file_keys, union them all into one DataFrame,
+    and return it.  Works for any number of files (1 or many).
+    """
+    if not file_keys:
+        return None
+
+    log_info(f"Stacking {len(file_keys)} file(s) for '{data_type_label}'")
+
+    combined_df = None
+    for idx, key in enumerate(file_keys):
+        file_path = f"s3://{s3_bucket}/{key}"
+        log_info(f"  Reading [{idx + 1}/{len(file_keys)}]: {file_path}")
+
+        # Use a unique ctx key so Glue's bookmark system tracks each file separately
+        ctx_key = f"{data_type_label.replace(' ', '_').replace('/', '_')}_{idx}"
+
+        current_df = glue_context.create_dynamic_frame.from_options(
+            format_options={
+                "quoteChar": '"',
+                "withHeader": True,
+                "separator": ",",
+            },
+            connection_type="s3",
+            format="csv",
+            connection_options={"paths": [file_path]},
+            transformation_ctx=ctx_key,
+        ).toDF()
+
+        combined_df = current_df if combined_df is None else combined_df.union(current_df)
+
+    if combined_df is None:
+        log_error(f"No data loaded for '{data_type_label}'")
+        return None
+
+    log_info(f"Schema for '{data_type_label}': {combined_df.schema.simpleString()}")
+
+    # Extract participant_id and timestamp from composite key when present
+    if "participantid_timestamp" in combined_df.columns:
+        combined_df = combined_df.withColumn(
+            "participant_id",
+            split(col("participantid_timestamp"), "_").getItem(0),
+        ).withColumn(
+            "timestamp",
+            split(col("participantid_timestamp"), "_").getItem(1),
+        )
+
+    log_info(f"Total rows for '{data_type_label}': {combined_df.count()}")
+    return combined_df
+
+
+def write_single_csv(s3_client, df, s3_bucket, output_key, temp_prefix):
+    """
+    Write df as a single CSV file at s3://s3_bucket/output_key.
+    Uses a temporary location + coalesce(1) then renames the part file.
+    """
+    spark_path = f"s3://{s3_bucket}/{temp_prefix}"
+
+    (df.coalesce(1)
+       .write
+       .mode("overwrite")
+       .options(header="true", delimiter=",", quote='"')
+       .csv(spark_path))
+
+    # Find the single part file Spark wrote
+    response = s3_client.list_objects_v2(Bucket=s3_bucket, Prefix=temp_prefix)
+    part_file = next(
+        (obj["Key"] for obj in response.get("Contents", [])
+         if obj["Key"].endswith(".csv") or "part-" in obj["Key"]),
+        None,
+    )
+
+    if not part_file:
+        raise RuntimeError(f"No part file found under s3://{s3_bucket}/{temp_prefix}")
+
+    # Copy to the final destination
+    s3_client.copy_object(
+        Bucket=s3_bucket,
+        CopySource={"Bucket": s3_bucket, "Key": part_file},
+        Key=output_key,
+    )
+
+    # Remove the temporary directory
+    temp_objects = s3_client.list_objects_v2(Bucket=s3_bucket, Prefix=temp_prefix)
+    for obj in temp_objects.get("Contents", []):
+        s3_client.delete_object(Bucket=s3_bucket, Key=obj["Key"])
+
+    log_info(f"Written single CSV: s3://{s3_bucket}/{output_key}")
+
+
+# ── Main job ──────────────────────────────────────────────────────────────────
 
 try:
-    # Initialize the job
     args = getResolvedOptions(sys.argv, ["JOB_NAME"])
     sc = SparkContext()
     glueContext = GlueContext(sc)
@@ -64,9 +180,7 @@ try:
     job = Job(glueContext)
     job.init(args["JOB_NAME"], args)
 
-    # Parse optional arguments from sys.argv (default arguments from CDK)
     def get_optional_arg(key, default):
-        """Get optional argument from sys.argv"""
         try:
             idx = sys.argv.index(f"--{key}")
             if idx + 1 < len(sys.argv):
@@ -75,266 +189,93 @@ try:
             pass
         return default
 
-    # S3 bucket and output path - using environment variables
-    # Get bucket names from default arguments passed by CDK, with fallback defaults
     source_bucket_name = get_optional_arg("SOURCE_BUCKET", "albanyhealthprocessed-s3bucket-dev")
     target_bucket_name = get_optional_arg("TARGET_BUCKET", "albanyhealthmerged-s3bucket-dev")
     output_path = f"s3://{source_bucket_name}/initial_append"
 
-    log_info("Job initialized successfully")
+    log_info("Job initialised successfully")
+    log_info(f"Source bucket : {source_bucket_name}")
+    log_info(f"Target bucket : {target_bucket_name}")
+    log_info(f"Output path   : {output_path}")
 
-    # This section lists ALL files in the bucket to help understand the structure
     s3_client = boto3.client("s3")
-    paginator = s3_client.get_paginator("list_objects_v2")
 
-    # Log all files and folders to understand structure
-    log_info("Listing all objects in bucket to understand structure...")
-    all_paths = []
+    # ── Step 1: Discover all patient folders (top-level prefixes) ────────────
+    # A "patient folder" is any top-level common prefix, e.g. "Testing-1_cd037752/"
+    log_info("Discovering patient folders in bucket …")
+    top_level_response = s3_client.list_objects_v2(
+        Bucket=source_bucket_name,
+        Delimiter="/"
+    )
+    patient_folders = [
+        cp["Prefix"].rstrip("/")
+        for cp in top_level_response.get("CommonPrefixes", [])
+        if not cp["Prefix"].startswith("initial_append")   # skip output folder
+        and not cp["Prefix"].startswith("error_logs")      # skip log folder
+    ]
 
-    for page in paginator.paginate(Bucket=source_bucket_name):
-        if "Contents" in page:
-            for obj in page["Contents"]:
-                key = obj["Key"]
-                all_paths.append(key)
+    if not patient_folders:
+        log_info("No patient folders found — nothing to process.")
+        job.commit()
+        sys.exit(0)
 
-    # Log a sample of paths to understand the structure
-    sample_paths = all_paths[:50] if len(all_paths) > 50 else all_paths
-    log_info(f"Sample of paths in bucket: {sample_paths}")
+    log_info(f"Found {len(patient_folders)} patient folder(s): {patient_folders}")
 
-    # Look for our data types anywhere in the paths
-    heart_rate_files = []
-    sleep_stage_files = []
-    step_files = []
-    respiration_files = []
-    stress_files = []
-    pulse_ox_files = []
+    # ── Step 2: For each patient × data_type, collect ALL csv files ──────────
+    # This is the key change: we scan the exact subfolder for each data type,
+    # so all files (whether 1 or 7+) are always included — including sleep.
+    patient_data = {}   # { patient_id: { data_type: [s3_key, …] } }
 
-    data_type_keywords = {
-        "garmin-device-heart-rate": heart_rate_files,
-        "garmin-connect-sleep-stage": sleep_stage_files,
-        "garmin-device-step": step_files,
-        "garmin-device-respiration": respiration_files,
-        "garmin-device-stress": stress_files,
-        "garmin-device-pulse-ox": pulse_ox_files,
-    }
-
-    # Alternative keywords in case the exact folder names don't match
-    alternative_keywords = {
-        "heart": heart_rate_files,
-        "sleep": sleep_stage_files,
-        "step": step_files,
-        "respiration": respiration_files,
-        "stress": stress_files,
-        "pulse": pulse_ox_files,
-        "spo2": pulse_ox_files,
-        "oxygen": pulse_ox_files,
-    }
-
-    for path in all_paths:
-        if path.endswith(".csv"):
-            # Check primary keywords
-            for keyword, file_list in data_type_keywords.items():
-                if keyword in path:
-                    file_list.append(path)
-                    break
+    for patient_id in patient_folders:
+        patient_data[patient_id] = {}
+        for data_type in ALL_DATA_TYPES:
+            prefix = f"{patient_id}/{data_type}/"
+            keys = list_csv_files_in_folder(s3_client, source_bucket_name, prefix)
+            if keys:
+                patient_data[patient_id][data_type] = keys
+                log_info(
+                    f"  {patient_id} / {data_type}: {len(keys)} file(s) found"
+                )
             else:
-                # If no primary keyword matched, check alternative keywords
-                for keyword, file_list in alternative_keywords.items():
-                    if keyword in path.lower():
-                        file_list.append(path)
-                        break
+                log_info(
+                    f"  {patient_id} / {data_type}: no files found (skipping)"
+                )
 
-    # Log what we found
-    log_info(f"Found {len(heart_rate_files)} heart rate files")
-    log_info(f"Found {len(sleep_stage_files)} sleep stage files")
-    log_info(f"Found {len(step_files)} step files")
-    log_info(f"Found {len(respiration_files)} respiration files")
-    log_info(f"Found {len(stress_files)} stress files")
-    log_info(f"Found {len(pulse_ox_files)} pulse-ox files")
+    # ── Step 3: Process and write each patient × data_type combination ───────
+    processed_patient_folders = set()
 
-    # Process each file type
-    def process_files_by_type(file_list, data_type_name):
-        if not file_list:
-            return None
+    for patient_id, type_map in patient_data.items():
+        if not type_map:
+            log_info(f"No recognised data files for {patient_id} — skipping")
+            continue
 
-        log_info(f"Processing {len(file_list)} files for {data_type_name}")
-        
-        # Create a list of all file paths
-        file_paths = [f"s3://{source_bucket_name}/{file}" for file in file_list]
-        
-        try:
-            # Read all files at once and combine them
-            combined_df = None
-            for file_path in file_paths:
-                log_info(f"Reading file: {file_path}")
-                current_df = glueContext.create_dynamic_frame.from_options(
-                    format_options={
-                        "quoteChar": '"',
-                        "withHeader": True,
-                        "separator": ",",
-                    },
-                    connection_type="s3",
-                    format="csv",
-                    connection_options={"paths": [file_path]},
-                    transformation_ctx=f"{data_type_name}_df_{file_path.split('/')[-1]}",
-                ).toDF()
+        for data_type, file_keys in type_map.items():
+            label = f"{data_type} / {patient_id}"
+            log_info(f"Processing: {label}  ({len(file_keys)} file(s))")
 
-                if combined_df is None:
-                    combined_df = current_df
-                else:
-                    combined_df = combined_df.union(current_df)
+            df = process_files_by_type(glueContext, source_bucket_name, file_keys, label)
 
-            if combined_df is not None:
-                # Display schema for debugging
-                log_info(f"{data_type_name} schema: {combined_df.schema.simpleString()}")
-                log_info(f"{data_type_name} columns: {combined_df.columns}")
-
-                # Extract participantId from composite key if present
-                if "participantid_timestamp" in combined_df.columns:
-                    combined_df = combined_df.withColumn(
-                        "participant_id",
-                        split(col("participantid_timestamp"), "_").getItem(0),
-                    )
-                    combined_df = combined_df.withColumn(
-                        "timestamp", split(col("participantid_timestamp"), "_").getItem(1)
-                    )
-
-                log_info(f"Successfully combined {combined_df.count()} total {data_type_name} records")
-                return combined_df
-            else:
-                log_error(f"Failed to load any {data_type_name} data")
-                return None
-
-        except Exception as e:
-            log_error(f"Error processing {data_type_name} files", str(e))
-            return None
-
-    # Process each data type and save to initial_append folder
-    data_types = {
-        "garmin-device-heart-rate": heart_rate_files,
-        "garmin-connect-sleep-stage": sleep_stage_files,
-        "garmin-device-step": step_files,
-        "garmin-device-respiration": respiration_files,
-        "garmin-device-stress": stress_files,
-        "garmin-device-pulse-ox": pulse_ox_files,
-    }
-
-    # Keep track of parent folders to delete
-    parent_folders = set()
-
-    # Group files by patient identifier
-    for data_type, files in data_types.items():
-        log_info(f"Processing {data_type} files...")
-        
-        # Group files by patient identifier
-        patient_files = {}
-        for file in files:
-            path_parts = file.split('/')
-            if len(path_parts) >= 2:
-                patient_id = path_parts[0]
-            else:
-                patient_id = 'unknown'
-            
-            if patient_id not in patient_files:
-                patient_files[patient_id] = []
-            patient_files[patient_id].append(file)
-            parent_folders.add(patient_id)
-
-        # Process files for each patient
-        for patient_id, patient_file_list in patient_files.items():
-            log_info(f"Processing {data_type} files for patient {patient_id}")
-            df = process_files_by_type(patient_file_list, f"{data_type} for {patient_id}")
-            
             if df is not None:
-                # Save the processed data to initial_append/patient_id folder
-                output_file_path = f"{output_path}/{patient_id}/{data_type}.csv"
-                log_info(f"Saving processed {data_type} data to {output_file_path}")
-                
-                try:
-                    # Write as a single CSV file using DataFrame operations
-                    (df.coalesce(1)  # Ensure single partition
-                       .write
-                       .mode("overwrite")  # Overwrite if exists
-                       .options(header='true', delimiter=',', quote='"')  # CSV options
-                       .csv(output_file_path.replace('.csv', '_temp')))  # Temporary location
-                    
-                    # Find the generated part file
-                    response = s3_client.list_objects_v2(
-                        Bucket=source_bucket_name,
-                        Prefix=f"initial_append/{patient_id}/{data_type}_temp"
-                    )
-                    
-                    if "Contents" in response:
-                        # Get the part file (should be only one due to coalesce)
-                        part_file = next((obj["Key"] for obj in response["Contents"] 
-                                        if obj["Key"].endswith(".csv") or "part-" in obj["Key"]), None)
-                        
-                        if part_file:
-                            # Copy to final destination with proper name
-                            s3_client.copy_object(
-                                Bucket=source_bucket_name,
-                                CopySource={'Bucket': source_bucket_name, 'Key': part_file},
-                                Key=f"initial_append/{patient_id}/{data_type}.csv"
-                            )
-                            
-                            # Delete temporary directory and its contents
-                            temp_objects = s3_client.list_objects_v2(
-                                Bucket=source_bucket_name,
-                                Prefix=f"initial_append/{patient_id}/{data_type}_temp"
-                            )
-                            
-                            if "Contents" in temp_objects:
-                                for obj in temp_objects["Contents"]:
-                                    s3_client.delete_object(
-                                        Bucket=source_bucket_name,
-                                        Key=obj["Key"]
-                                    )
-                            
-                            log_info(f"Successfully created single CSV file: initial_append/{patient_id}/{data_type}.csv")
-                        else:
-                            log_error(f"No CSV file found in temporary directory for {patient_id}/{data_type}")
-                    
-                except Exception as e:
-                    log_error(f"Error creating CSV file for {patient_id}/{data_type}", str(e))
-                    raise e
-                
-                log_info(f"Successfully saved {data_type} data for {patient_id} with {df.count()} records")
+                output_key  = f"initial_append/{patient_id}/{data_type}.csv"
+                temp_prefix = f"initial_append/{patient_id}/{data_type}_temp/"
 
-    # Delete all parent folders after successful processing
-    try:
-        log_info("Deleting parent folders...")
-        for parent_folder in parent_folders:
-            # List all objects under the parent folder
-            paginator = s3_client.get_paginator('list_objects_v2')
-            pages = paginator.paginate(
-                Bucket=source_bucket_name,
-                Prefix=f"{parent_folder}/"
-            )
-            
-            # Delete all objects under the parent folder
-            for page in pages:
-                if "Contents" in page:
-                    for obj in page["Contents"]:
-                        s3_client.delete_object(
-                            Bucket=source_bucket_name,
-                            Key=obj["Key"]
-                        )
-            
-            # Delete the parent folder marker if it exists
-            s3_client.delete_object(
-                Bucket=source_bucket_name,
-                Key=f"{parent_folder}/"
-            )
-            
-            log_info(f"Deleted parent folder and all contents: {parent_folder}")
-            
-    except Exception as e:
-        log_error("Error deleting parent folders", str(e))
-        raise e
+                try:
+                    write_single_csv(s3_client, df, source_bucket_name, output_key, temp_prefix)
+                    log_info(f"Saved: s3://{source_bucket_name}/{output_key}")
+                    processed_patient_folders.add(patient_id)
+                except Exception as e:
+                    log_error(f"Error writing CSV for {label}", str(e))
+                    raise
+
+    # ── Step 4: Delete original patient folders now all types are processed ──
+    log_info("Removing original patient folders from processed bucket …")
+    for patient_id in processed_patient_folders:
+        delete_folder(s3_client, source_bucket_name, f"{patient_id}/")
+        log_info(f"Deleted original folder: {patient_id}/")
 
     job.commit()
     log_info("Job completed successfully")
 
 except Exception as e:
     log_error("Fatal error in main job flow", str(e))
-    raise e 
+    raise e

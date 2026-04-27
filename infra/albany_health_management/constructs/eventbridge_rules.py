@@ -7,7 +7,7 @@ from constructs import Construct
 from ..config import EnvironmentConfig
 
 class EventBridgeRules(Construct):
-    def __init__(self, scope: Construct, construct_id: str, data_inactivity_checker_function, glue_workflows, survey_data_merged_files_function, survey_data_delete_processing_files_function, environment: EnvironmentConfig = None, **kwargs) -> None:
+    def __init__(self, scope: Construct, construct_id: str, data_inactivity_checker_function, glue_workflows, survey_data_merged_files_function, survey_data_delete_processing_files_function, survey_batch_checker_function, environment: EnvironmentConfig = None, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
         
         # Default to dev environment if not provided
@@ -25,6 +25,12 @@ class EventBridgeRules(Construct):
             )
         )
         survey_data_merged_files_function.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["events:PutEvents"],
+                resources=["*"],
+            )
+        )
+        survey_batch_checker_function.add_to_role_policy(
             iam.PolicyStatement(
                 actions=["events:PutEvents"],
                 resources=["*"],

@@ -9,6 +9,7 @@ from aws_cdk import (
 from constructs import Construct
 from .constructs.s3_buckets import S3Buckets
 from .constructs.sqs_queues import SQSQueues
+from .constructs.dynamodb_table import DynamoDBTables
 from .constructs.lambda_functions import LambdaFunctions
 from .constructs.glue_jobs import GlueJobs
 from .constructs.glue_workflows import GlueWorkflows
@@ -32,6 +33,9 @@ class AlbanyHealthManagementStack(Stack):
         # Create SQS queues
         sqs_queues = SQSQueues(self, "SQSQueues", environment=env_config)
 
+        # Create DynamoDB tables
+        dynamodb_tables = DynamoDBTables(self, "DynamoDBTables", environment=env_config)
+
         # Create Lambda functions
         lambda_functions = LambdaFunctions(
             self,
@@ -43,10 +47,13 @@ class AlbanyHealthManagementStack(Stack):
             sqs_queues.step_queue,
             sqs_queues.processing_files_queue,
             sqs_queues.survey_data_file_queue,
+            sqs_queues.survey_processing_files_queue,
             s3_buckets.source_bucket,
             s3_buckets.processed_bucket,
             s3_buckets.survey_data_processing_bucket,
             s3_buckets.survey_data_merged_bucket,
+            batch_tracking_table=dynamodb_tables.batch_tracking_table,
+            survey_batch_tracking_table=dynamodb_tables.survey_batch_tracking_table,
             environment=env_config
         )
         
@@ -72,6 +79,7 @@ class AlbanyHealthManagementStack(Stack):
             glue_workflows,
             lambda_functions.survey_data_merged_files_function,
             lambda_functions.survey_data_delete_processing_files_function,
+            lambda_functions.survey_batch_checker_function,
             environment=env_config,
         )
 
@@ -117,3 +125,12 @@ class AlbanyHealthManagementStack(Stack):
 
         # Configure the processing SQS queue to trigger the inactivity checker Lambda function
         lambda_functions.data_inactivity_checker_function.add_event_source(lambda_event_sources.SqsEventSource(sqs_queues.processing_files_queue))
+
+        # Survey processing bucket → SQS → survey batch checker Lambda
+        s3_buckets.survey_data_processing_bucket.add_event_notification(
+            s3.EventType.OBJECT_CREATED,
+            s3n.SqsDestination(sqs_queues.survey_processing_files_queue)
+        )
+        lambda_functions.survey_batch_checker_function.add_event_source(
+            lambda_event_sources.SqsEventSource(sqs_queues.survey_processing_files_queue)
+        )

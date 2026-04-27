@@ -81,14 +81,23 @@ def _get_csv_files(bucket: str, patient_folder: str) -> list:
 def _merge_files(bucket: str, csv_files: list) -> pd.DataFrame:
     """
     Read all CSV files for a patient and merge into a single DataFrame.
+    Zero-byte placeholder files (written when source was empty/unparseable) are skipped.
     """
     dfs = []
     for key in csv_files:
         logger.info("Reading file: %s", key)
         obj = s3.get_object(Bucket=bucket, Key=key)
-        raw_text = _decode_bytes(obj["Body"].read())
-        df = pd.read_csv(io.StringIO(raw_text), dtype=str, keep_default_na=False)
-        dfs.append(df)
+        raw_bytes = obj["Body"].read()
+        if not raw_bytes.strip():
+            logger.info("Skipping empty placeholder file: %s", key)
+            continue
+        try:
+            raw_text = _decode_bytes(raw_bytes)
+            df = pd.read_csv(io.StringIO(raw_text), dtype=str, keep_default_na=False)
+            if not df.empty:
+                dfs.append(df)
+        except Exception as e:
+            logger.warning("Could not read %s — skipping. Reason: %s", key, e)
 
     if not dfs:
         return pd.DataFrame()

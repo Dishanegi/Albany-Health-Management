@@ -2,844 +2,443 @@ import json
 import os
 import boto3
 import logging
-from datetime import datetime
-from typing import Dict, List, Any
-from botocore.exceptions import ClientError
-import hashlib
 import urllib.parse
-import time
-import random
+from datetime import datetime, timezone
+from typing import Dict, Any, Optional
+from botocore.exceptions import ClientError
 
-# Configure logging
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-# Function to get expected file counts from environment variables
-def get_expected_file_counts() -> Dict[str, int]:
-    """
-    Get expected file counts per patient from environment variables.
-    Sleep-stage is always 1, others are configurable via env vars.
-    """
+# ── Garmin data-type → DynamoDB attribute names ──────────────────────────────
+# actual count attribute   = how many processed files have arrived so far
+# expected count attribute = how many files exist in the SOURCE bucket for this type
+
+FILE_TYPE_TO_ATTR = {
+    'garmin-device-heart-rate':   'heart_rate_count',
+    'garmin-device-stress':       'stress_count',
+    'garmin-device-step':         'step_count',
+    'garmin-device-respiration':  'respiration_count',
+    'garmin-device-pulse-ox':     'pulse_ox_count',
+    'garmin-connect-sleep-stage': 'sleep_count',
+}
+
+FILE_TYPE_TO_EXPECTED_ATTR = {
+    'garmin-device-heart-rate':   'expected_heart_rate_count',
+    'garmin-device-stress':       'expected_stress_count',
+    'garmin-device-step':         'expected_step_count',
+    'garmin-device-respiration':  'expected_respiration_count',
+    'garmin-device-pulse-ox':     'expected_pulse_ox_count',
+    'garmin-connect-sleep-stage': 'expected_sleep_count',
+}
+
+ALL_DATA_TYPES = list(FILE_TYPE_TO_ATTR.keys())
+
+
+def get_eventbridge_config() -> Dict[str, str]:
     return {
-        'garmin-device-heart-rate': int(os.environ.get('EXPECTED_HEART_RATE_FILES', '7')),
-        'garmin-device-stress': int(os.environ.get('EXPECTED_STRESS_FILES', '7')),
-        'garmin-device-step': int(os.environ.get('EXPECTED_STEP_FILES', '7')),
-        'garmin-device-respiration': int(os.environ.get('EXPECTED_RESPIRATION_FILES', '7')),
-        'garmin-device-pulse-ox': int(os.environ.get('EXPECTED_PULSE_OX_FILES', '7')),
-        'garmin-connect-sleep-stage': 1  # Always 1
-    }
-
-# Completion strategy configuration
-COMPLETION_THRESHOLD_PERCENTAGE = 80
-
-# Retry configuration for race condition handling
-MAX_RETRY_ATTEMPTS = 5
-BASE_RETRY_DELAY = 0.1  # 100ms base delay
-MAX_RETRY_DELAY = 2.0   # 2 second max delay
-
-# EventBridge configuration - loaded from environment variables
-def get_eventbridge_config():
-    """
-    Get EventBridge configuration from environment variables
-    Includes environment-specific detail-types to ensure events only match this environment's rules
-    """
-    return {
-        'bus_name': os.environ.get('EVENTBRIDGE_BUS_NAME', 'default'),
+        'bus_name':             os.environ.get('EVENTBRIDGE_BUS_NAME', 'default'),
+        'garmin_detail_type':   os.environ.get('EVENTBRIDGE_GARMIN_DETAIL_TYPE', 'AlbanyHealthGarminHealthMetricsWorkflow'),
+        'bbi_detail_type':      os.environ.get('EVENTBRIDGE_BBI_DETAIL_TYPE', 'AlbanyHealthGarminBBIWorkflow'),
         'completion_rule_name': os.environ.get('EVENTBRIDGE_COMPLETION_RULE_NAME', 'trigger-merge-patient-health-metrics'),
         'processing_rule_name': os.environ.get('EVENTBRIDGE_PROCESSING_RULE_NAME', 'trigger-patients-bbi-flow'),
-        'garmin_detail_type': os.environ.get('EVENTBRIDGE_GARMIN_DETAIL_TYPE', 'AlbanyHealthGarminHealthMetricsWorkflow'),
-        'bbi_detail_type': os.environ.get('EVENTBRIDGE_BBI_DETAIL_TYPE', 'AlbanyHealthGarminBBIWorkflow'),
-        'survey_rule_name': os.environ.get('EVENTBRIDGE_SURVEY_RULE_NAME', 'trigger-survey-data-merged-files'),
-        'survey_detail_type': os.environ.get('EVENTBRIDGE_SURVEY_DETAIL_TYPE', 'AlbanyHealthSurveyDataMergedFiles'),
     }
 
+
+# ── Lambda entry point ───────────────────────────────────────────────────────
+
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
-    """
-    Lambda function with race condition protection using S3 conditional writes
-    """
-    
-    # Initialize AWS clients
-    s3 = boto3.client('s3')
+    table_name    = os.environ['BATCH_TRACKING_TABLE']
+    source_bucket = os.environ['SOURCE_BUCKET']
+
+    dynamodb   = boto3.client('dynamodb')
+    s3         = boto3.client('s3')
     eventbridge = boto3.client('events')
-    
-    processed_messages = []
-    failed_messages = []
-    duplicate_messages = []
-    batch_completions = []
-    race_condition_retries = []
-    
-    # Track processed events within this execution
-    processed_events = set()
-    
-    logger.info(f"Received {len(event['Records'])} messages from SQS")
-    
-    # Process each SQS message
+
+    processed, skipped, failed = [], [], []
+
+    logger.info(f"Received {len(event['Records'])} SQS messages")
+
     for record in event['Records']:
+        message_id = record.get('messageId', 'unknown')
         try:
-            message_id = record['messageId']
             message_body = json.loads(record['body'])
-            
-            logger.info(f"Processing message {message_id}")
-            
-            # Extract S3 record from SQS message
-            s3_record = extract_s3_record_from_sqs_message(message_body)
-            
-            if s3_record:
-                # Create event fingerprint for deduplication
-                event_fingerprint = create_event_fingerprint(s3_record)
-                
-                # Skip if already processed in this execution
-                if event_fingerprint in processed_events:
-                    logger.info(f"Skipping duplicate event in same execution: {event_fingerprint}")
-                    duplicate_messages.append({
-                        'messageId': message_id,
-                        'reason': 'duplicate_in_execution',
-                        'fingerprint': event_fingerprint
-                    })
-                    continue
-                
-                processed_events.add(event_fingerprint)
-                
-                # Process with race condition protection
-                result = process_s3_event_with_race_protection(
-                    s3_record, s3, eventbridge, event_fingerprint
-                )
-                
-                if result['success']:
-                    processed_messages.append({
-                        'messageId': message_id,
-                        'status': 'processed',
-                        'timestamp': datetime.utcnow().isoformat(),
-                        'result': result['data'],
-                        'fingerprint': event_fingerprint,
-                        'retry_attempts': result.get('retry_attempts', 0)
-                    })
-                    
-                    # Track race condition retries for monitoring
-                    if result.get('retry_attempts', 0) > 0:
-                        race_condition_retries.append({
-                            'messageId': message_id,
-                            'attempts': result['retry_attempts'],
-                            'final_status': 'success'
-                        })
-                    
-                    # Track batch completions
-                    if result.get('batch_completed'):
-                        batch_completions.append(result['batch_info'])
-                        
-                elif result.get('duplicate'):
-                    duplicate_messages.append({
-                        'messageId': message_id,
-                        'reason': 'already_processed',
-                        'fingerprint': event_fingerprint,
-                        'timestamp': datetime.utcnow().isoformat()
-                    })
-                else:
-                    failed_messages.append({
-                        'messageId': message_id,
-                        'error': result['error'],
-                        'timestamp': datetime.utcnow().isoformat(),
-                        'retry_attempts': result.get('retry_attempts', 0)
-                    })
-                    
-                    # Track failed race condition retries
-                    if result.get('retry_attempts', 0) > 0:
-                        race_condition_retries.append({
-                            'messageId': message_id,
-                            'attempts': result['retry_attempts'],
-                            'final_status': 'failed'
-                        })
+            s3_record = extract_s3_record(message_body)
+
+            if not s3_record:
+                logger.warning(f"Message {message_id}: no S3 record found, skipping")
+                skipped.append(message_id)
+                continue
+
+            bucket_name, object_key = extract_s3_coordinates(s3_record)
+            if not bucket_name or not object_key:
+                logger.warning(f"Message {message_id}: missing bucket/key, skipping")
+                skipped.append(message_id)
+                continue
+
+            batch_info = parse_object_key(object_key)
+            if not batch_info:
+                logger.info(f"Message {message_id}: key {object_key!r} does not match batch pattern, skipping")
+                skipped.append(message_id)
+                continue
+
+            result = process_file(dynamodb, s3, eventbridge, table_name, source_bucket, batch_info)
+
+            if result == 'duplicate':
+                skipped.append(message_id)
+            elif result == 'triggered':
+                processed.append({'messageId': message_id, 'batch_triggered': True})
             else:
-                # Handle invalid S3 event format
-                error_msg = f"Invalid S3 event format in SQS message"
-                logger.error(f"Message {message_id}: {error_msg}")
-                failed_messages.append({
-                    'messageId': message_id,
-                    'error': error_msg,
-                    'timestamp': datetime.utcnow().isoformat()
-                })
-                    
-        except json.JSONDecodeError as e:
-            error_msg = f"Invalid JSON in message body: {str(e)}"
-            logger.error(f"Message {message_id}: {error_msg}")
-            failed_messages.append({
-                'messageId': message_id,
-                'error': error_msg,
-                'timestamp': datetime.utcnow().isoformat()
-            })
-            
+                processed.append({'messageId': message_id, 'batch_triggered': False})
+
         except Exception as e:
-            error_msg = f"Unexpected error processing message: {str(e)}"
-            logger.error(f"Message {message_id}: {error_msg}")
-            failed_messages.append({
-                'messageId': message_id,
-                'error': error_msg,
-                'timestamp': datetime.utcnow().isoformat()
-            })
-    
-    # Log summary with race condition statistics
-    logger.info(f"Processing complete. Successful: {len(processed_messages)}, "
-                f"Failed: {len(failed_messages)}, Duplicates: {len(duplicate_messages)}, "
-                f"Batch Completions: {len(batch_completions)}, "
-                f"Race Condition Retries: {len(race_condition_retries)}")
-    
-    if race_condition_retries:
-        total_retry_attempts = sum(r['attempts'] for r in race_condition_retries)
-        logger.info(f"Race condition handling: {len(race_condition_retries)} messages required retries, "
-                   f"total retry attempts: {total_retry_attempts}")
-    
-    # Handle failed messages
-    if failed_messages:
-        handle_failed_messages(failed_messages)
-    
-    # Return response
+            logger.error(f"Message {message_id}: unexpected error — {e}", exc_info=True)
+            failed.append({'messageId': message_id, 'error': str(e)})
+
+    logger.info(f"Done. processed={len(processed)}, skipped={len(skipped)}, failed={len(failed)}")
+
     return {
         'statusCode': 200,
         'body': json.dumps({
-            'processedCount': len(processed_messages),
-            'failedCount': len(failed_messages),
-            'duplicateCount': len(duplicate_messages),
-            'batchCompletionsCount': len(batch_completions),
-            'raceConditionRetries': len(race_condition_retries),
-            'processedMessages': processed_messages,
-            'failedMessages': failed_messages,
-            'duplicateMessages': duplicate_messages,
-            'batchCompletions': batch_completions,
-            'raceConditionStats': race_condition_retries,
-            'timestamp': datetime.utcnow().isoformat()
+            'processedCount': len(processed),
+            'skippedCount':   len(skipped),
+            'failedCount':    len(failed),
+            'processed':      processed,
+            'failed':         failed,
+            'timestamp':      datetime.now(timezone.utc).isoformat(),
         })
     }
 
-def extract_s3_record_from_sqs_message(message_body: Dict[str, Any]) -> Dict[str, Any]:
+
+# ── Core processing logic ────────────────────────────────────────────────────
+
+def process_file(
+    dynamodb_client,
+    s3_client,
+    eventbridge_client,
+    table_name: str,
+    source_bucket: str,
+    batch_info: Dict[str, Any],
+) -> str:
     """
-    Extract S3 event record from SQS message body (S3 → SQS → Lambda flow only)
+    Atomically record the processed file in DynamoDB.
+
+    Expected counts are NOT hardcoded — they are read dynamically from the
+    source bucket (albanyhealthsource-s3bucket-{env}) by counting how many
+    CSV files exist under {patient_id}/{data_type}/.
+
+    Returns: 'duplicate' | 'triggered' | 'counted'
     """
+    patient_id = batch_info['patient_id']
+    file_type  = batch_info['file_type']
+    filename   = batch_info['filename']
+    batch_date = batch_info['batch_date']
+    file_id    = f"{file_type}/{filename}"
+
+    # Append batch_date to patient_id so each weekly submission gets its own row
+    # without needing a sort key. e.g. "Testing-1_cd037752#2025-02-04"
+    db_key = {'patient_id': {'S': f"{patient_id}#{batch_date}"}}
+
+    count_attr    = FILE_TYPE_TO_ATTR[file_type]
+    expected_attr = FILE_TYPE_TO_EXPECTED_ATTR[file_type]
+    now = datetime.now(timezone.utc).isoformat()
+
+    # ── Step 1: Get expected count — DynamoDB first, S3 only if not yet stored ─
+    # On the first processed file of a given type for this patient, the expected
+    # count has not been stored yet so we query S3.  On every subsequent file of
+    # the same type the value is already in DynamoDB, so we skip the S3 call.
+    pre_check = dynamodb_client.get_item(
+        TableName=table_name,
+        Key=db_key,
+        ConsistentRead=False,
+    )
+    existing_item = pre_check.get('Item', {})
+
+    stored_expected = int(existing_item.get(expected_attr, {}).get('N', '0'))
+
+    if stored_expected > 0:
+        # Expected count for this metric already stored — no need to query S3
+        source_count = stored_expected
+        logger.info(f"Expected count for {file_type}: {source_count} (from DynamoDB, skipping S3)")
+    else:
+        # First file of this metric for this patient — query S3 to get the expected count
+        source_count = count_source_files(s3_client, source_bucket, patient_id, file_type)
+        if source_count == 0:
+            logger.warning(
+                f"No source files found for {patient_id}/{file_type} in {source_bucket}. "
+                f"Expected count will remain unset for this type."
+            )
+
+    # ── Step 2: Atomic write — count the processed file, set expected once ───
+    #
+    # The UpdateExpression does three things in a single atomic call:
+    #   SET  — initialise status/created_at on the very first write for this
+    #          patient; set expected_<type>_count once (if_not_exists so it is
+    #          never overwritten by a later, possibly lower, source count)
+    #   ADD  — atomically increment the per-type counter, total_files, and
+    #          append file_id to the StringSet for deduplication
+    #
+    # The ConditionExpression rejects the write if this file_id was already
+    # counted, giving us free atomic deduplication.
     try:
-        # Case 1: Standard S3 event notification format
-        if 'Records' in message_body:
-            logger.info("Processing S3 event notification format")
-            
-            # Find the first S3 record in the Records array
-            for record in message_body['Records']:
-                if record.get('eventSource') == 'aws:s3':
-                    logger.info(f"Found S3 record: {record.get('eventName', 'unknown')} on {record.get('s3', {}).get('bucket', {}).get('name')}/{record.get('s3', {}).get('object', {}).get('key')}")
-                    return record
-            
-            logger.warning("No S3 records found in Records array")
-            return None
-            
-        # Case 2: Already a single S3 record (rare but possible)
-        elif message_body.get('eventSource') == 'aws:s3':
-            logger.info("Processing single S3 event record")
-            return message_body
-            
-        else:
-            logger.error(f"Invalid message format - expected S3 event notification. Keys found: {list(message_body.keys())}")
-            return None
-            
-    except Exception as e:
-        logger.error(f"Error extracting S3 record from SQS message: {str(e)}")
+        update_expr = (
+            'SET #st          = if_not_exists(#st, :processing), '
+            '    created_at   = if_not_exists(created_at, :now), '
+            '    last_updated = :now '
+        )
+        expr_attr_names = {
+            '#st':  'status',
+            '#cnt': count_attr,
+        }
+        expr_attr_values = {
+            ':one':        {'N': '1'},
+            ':file_set':   {'SS': [file_id]},
+            ':file_id':    {'S': file_id},
+            ':processing': {'S': 'processing'},
+            ':now':        {'S': now},
+        }
+
+        # Only store expected count if we actually found source files
+        if source_count > 0:
+            update_expr += ', #exp_cnt = if_not_exists(#exp_cnt, :source_count) '
+            expr_attr_names['#exp_cnt'] = expected_attr
+            expr_attr_values[':source_count'] = {'N': str(source_count)}
+
+        update_expr += 'ADD #cnt :one, total_files :one, processed_files :file_set'
+
+        dynamodb_client.update_item(
+            TableName=table_name,
+            Key=db_key,
+            UpdateExpression=update_expr,
+            ConditionExpression='NOT contains(processed_files, :file_id)',
+            ExpressionAttributeNames=expr_attr_names,
+            ExpressionAttributeValues=expr_attr_values,
+        )
+        logger.info(
+            f"Counted {file_id} for {patient_id} "
+            f"(source_count={source_count})"
+        )
+
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
+            logger.info(f"Duplicate: {file_id} for {patient_id} already counted")
+            return 'duplicate'
+        raise
+
+    # ── Step 3: Read back current state to check batch completion ────────────
+    response = dynamodb_client.get_item(
+        TableName=table_name,
+        Key=db_key,
+        ConsistentRead=True,
+    )
+    item = response.get('Item', {})
+
+    if not is_batch_complete(item):
+        log_progress(patient_id, item)
+        return 'counted'
+
+    # ── Step 4: Atomically claim the "trigger" role ───────────────────────────
+    # Of all the concurrent Lambda invocations that reach this point,
+    # only one wins this conditional write and fires EventBridge.
+    try:
+        dynamodb_client.update_item(
+            TableName=table_name,
+            Key=db_key,
+            UpdateExpression='SET #st = :complete, completed_at = :now',
+            ConditionExpression='#st = :processing',
+            ExpressionAttributeNames={'#st': 'status'},
+            ExpressionAttributeValues={
+                ':complete':   {'S': 'complete'},
+                ':processing': {'S': 'processing'},
+                ':now':        {'S': now},
+            },
+        )
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
+            logger.info(
+                f"Batch {patient_id} already marked complete by another invocation — "
+                f"skipping EventBridge"
+            )
+            return 'counted'
+        raise
+
+    # ── Step 5: Trigger EventBridge ───────────────────────────────────────────
+    logger.info(f"Batch {patient_id} complete — triggering EventBridge")
+    trigger_eventbridge(eventbridge_client, patient_id, item)
+    return 'triggered'
+
+
+# ── Source bucket counting ────────────────────────────────────────────────────
+
+def count_source_files(s3_client, source_bucket: str, patient_id: str, file_type: str) -> int:
+    """
+    Count how many CSV files exist in:
+        s3://{source_bucket}/{patient_id}/{file_type}/
+
+    This is the ground-truth expected count for this patient + data type.
+    Uses pagination to handle more than 1000 files.
+    """
+    prefix = f"{patient_id}/{file_type}/"
+    count = 0
+
+    paginator = s3_client.get_paginator('list_objects_v2')
+    for page in paginator.paginate(Bucket=source_bucket, Prefix=prefix):
+        for obj in page.get('Contents', []):
+            if obj['Key'].endswith('.csv'):
+                count += 1
+
+    logger.info(
+        f"Source bucket count — {source_bucket}/{prefix} : {count} file(s)"
+    )
+    return count
+
+
+# ── Completion check ──────────────────────────────────────────────────────────
+
+def is_batch_complete(item: Dict[str, Any]) -> bool:
+    """
+    Batch is complete when EVERY data type that has source files
+    (expected_<type>_count > 0) has been fully processed
+    (actual_<type>_count >= expected_<type>_count).
+
+    Types where expected = 0 (or not yet set) are skipped — they were
+    not part of this patient's batch.
+
+    At least one type must be present for the batch to be considered complete.
+    """
+    has_any_type = False
+
+    for file_type in ALL_DATA_TYPES:
+        count_attr    = FILE_TYPE_TO_ATTR[file_type]
+        expected_attr = FILE_TYPE_TO_EXPECTED_ATTR[file_type]
+
+        expected = int(item.get(expected_attr, {}).get('N', '0'))
+
+        if expected == 0:
+            # This data type was not part of this patient's batch
+            continue
+
+        has_any_type = True
+        actual = int(item.get(count_attr, {}).get('N', '0'))
+
+        if actual < expected:
+            return False
+
+    return has_any_type
+
+
+def log_progress(patient_id: str, item: Dict[str, Any]) -> None:
+    """Log per-type actual vs expected counts for debugging."""
+    counts = {}
+    for file_type in ALL_DATA_TYPES:
+        count_attr    = FILE_TYPE_TO_ATTR[file_type]
+        expected_attr = FILE_TYPE_TO_EXPECTED_ATTR[file_type]
+        actual   = int(item.get(count_attr, {}).get('N', '0'))
+        expected = int(item.get(expected_attr, {}).get('N', '0'))
+        if expected > 0:
+            counts[file_type] = f"{actual}/{expected}"
+
+    total = int(item.get('total_files', {}).get('N', '0'))
+    logger.info(f"Progress for {patient_id}: {total} file(s) processed — {counts}")
+
+
+# ── EventBridge trigger ───────────────────────────────────────────────────────
+
+def trigger_eventbridge(eventbridge_client, patient_id: str, item: Dict[str, Any]) -> None:
+    cfg = get_eventbridge_config()
+    now = datetime.now(timezone.utc).isoformat()
+
+    base = {}
+    if cfg['bus_name'] and cfg['bus_name'] != 'default':
+        base['EventBusName'] = cfg['bus_name']
+
+    detail_common = {
+        'batchId':    patient_id,
+        'completedAt': now,
+        'status':     'complete',
+        'totalFiles': int(item.get('total_files', {}).get('N', '0')),
+        'metadata': {
+            'batchFolder': patient_id,
+        }
+    }
+
+    events = [
+        {
+            'Source':     'lambda',
+            'DetailType': cfg['garmin_detail_type'],
+            'Detail':     json.dumps({**detail_common, 'targetRule': cfg['completion_rule_name']}),
+            **base,
+        },
+        {
+            'Source':     'lambda',
+            'DetailType': cfg['bbi_detail_type'],
+            'Detail':     json.dumps({**detail_common, 'targetRule': cfg['processing_rule_name']}),
+            **base,
+        },
+    ]
+
+    response = eventbridge_client.put_events(Entries=events)
+    failed_count = response.get('FailedEntryCount', 0)
+    if failed_count:
+        logger.error(
+            f"EventBridge: {failed_count} event(s) failed for batch {patient_id}: "
+            f"{response['Entries']}"
+        )
+    else:
+        logger.info(
+            f"EventBridge: sent 2 events for batch {patient_id} — "
+            f"garmin={cfg['garmin_detail_type']}, bbi={cfg['bbi_detail_type']}"
+        )
+
+
+# ── S3 / SQS parsing helpers ──────────────────────────────────────────────────
+
+def extract_s3_record(message_body: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Pull the first S3 record out of a standard S3-event-via-SQS message."""
+    if 'Records' in message_body:
+        for rec in message_body['Records']:
+            if rec.get('eventSource') == 'aws:s3':
+                return rec
+    elif message_body.get('eventSource') == 'aws:s3':
+        return message_body
+    return None
+
+
+def extract_s3_coordinates(s3_record: Dict[str, Any]):
+    s3_info = s3_record.get('s3', {})
+    bucket  = s3_info.get('bucket', {}).get('name')
+    key     = s3_info.get('object', {}).get('key')
+    if key:
+        key = urllib.parse.unquote_plus(key)
+    return bucket, key
+
+
+def parse_object_key(object_key: str) -> Optional[Dict[str, Any]]:
+    """
+    Expected format: {patient_id}/{file_type}/{filename}
+    e.g. Testing-1_cd037752/garmin-device-heart-rate/250204_garmin-device-heart-rate_Testing-1_cd037752.csv
+
+    Also extracts batch_date from the YYMMDD prefix in the filename so that
+    the DynamoDB composite key (patient_id, batch_date) is unique per submission.
+    """
+    parts = object_key.split('/')
+    if len(parts) < 3:
         return None
 
-def create_event_fingerprint(s3_record: Dict[str, Any]) -> str:
-    """
-    Create a unique fingerprint for S3 events to detect duplicates
-    """
-    try:
-        s3_info = s3_record.get('s3', {})
-        bucket = s3_info.get('bucket', {}).get('name')
-        key = s3_info.get('object', {}).get('key')
-        etag = s3_info.get('object', {}).get('eTag', '')
-        event_name = s3_record.get('eventName', '')
-        
-        # URL decode the key
-        if key:
-            key = urllib.parse.unquote_plus(key)
-        
-        # Create fingerprint from bucket, key, etag, and event type
-        fingerprint_data = f"{bucket}#{key}#{etag}#{event_name}"
-        fingerprint = hashlib.md5(fingerprint_data.encode()).hexdigest()
-        
-        logger.debug(f"Created fingerprint {fingerprint} for {fingerprint_data}")
-        return fingerprint
-        
-    except Exception as e:
-        logger.error(f"Error creating event fingerprint: {str(e)}")
-        return hashlib.md5(str(s3_record).encode()).hexdigest()
+    patient_id = parts[0]
+    file_type  = parts[1]
+    filename   = parts[2]
 
-def process_s3_event_with_race_protection(s3_record: Dict[str, Any], s3_client, eventbridge_client, event_fingerprint: str) -> Dict[str, Any]:
-    """
-    Process S3 event with race condition protection using exponential backoff retries
-    """
-    try:
-        # Extract bucket and key
-        s3_info = s3_record.get('s3', {})
-        bucket_name = s3_info.get('bucket', {}).get('name')
-        object_key = s3_info.get('object', {}).get('key')
-        
-        if object_key:
-            object_key = urllib.parse.unquote_plus(object_key)
-        
-        logger.info(f"Processing S3 event - Bucket: {bucket_name}, Key: {object_key}")
-        
-        if not bucket_name or not object_key:
-            raise ValueError(f"Missing bucket name ({bucket_name}) or object key ({object_key})")
-        
-        # Parse the object key to extract batch info
-        batch_info = parse_object_key(object_key)
-        if not batch_info:
-            logger.warning(f"Could not parse batch info from key: {object_key}")
-            return process_regular_s3_event(bucket_name, object_key, s3_client)
-        
-        batch_info['event_fingerprint'] = event_fingerprint
-        logger.info(f"Parsed batch info: {batch_info}")
-        
-        # Update batch.json with race condition protection
-        update_result = update_batch_json_with_race_protection(s3_client, bucket_name, batch_info)
-        
-        # If already processed, return duplicate flag
-        if update_result.get('already_processed'):
-            logger.info(f"File already processed: {object_key}")
-            return {
-                'success': True,
-                'duplicate': True,
-                'data': update_result,
-                'retry_attempts': update_result.get('retry_attempts', 0)
-            }
-        
-        # Check if batch just became complete and trigger EventBridge
-        batch_completed = False
-        batch_complete = update_result.get('batch_complete', False)
-        batch_newly_completed = update_result.get('batch_newly_completed', False)
-        
-        logger.info(f"Checking EventBridge trigger condition for batch {batch_info['batch_folder']}: "
-                   f"batch_complete={batch_complete}, batch_newly_completed={batch_newly_completed}")
-        
-        if batch_complete and batch_newly_completed:
-            logger.info(f"Batch {batch_info['batch_folder']} just became complete! Triggering EventBridge rules...")
-            
-            eventbridge_results = trigger_batch_complete_events(
-                eventbridge_client, 
-                bucket_name, 
-                batch_info, 
-                update_result
-            )
-            
-            batch_completed = True
-            update_result['eventbridge_results'] = eventbridge_results
-        else:
-            logger.info(f"EventBridge NOT triggered for batch {batch_info['batch_folder']}: "
-                       f"batch_complete={batch_complete}, batch_newly_completed={batch_newly_completed}")
-        
-        # Get object metadata for S3 native events
-        try:
-            response = s3_client.head_object(Bucket=bucket_name, Key=object_key)
-            object_size = response.get('ContentLength')
-            last_modified = response.get('LastModified').isoformat() if response.get('LastModified') else None
-        except ClientError as e:
-            logger.warning(f"Could not get object metadata for {object_key}: {e}")
-            # Fallback to event data
-            object_size = s3_record.get('s3', {}).get('object', {}).get('size', 0)
-            last_modified = s3_record.get('eventTime')
-        
-        return {
-            'success': True,
-            'duplicate': False,
-            'batch_completed': batch_completed,
-            'batch_info': batch_info,
-            'retry_attempts': update_result.get('retry_attempts', 0),
-            'data': {
-                'bucket': bucket_name,
-                'key': object_key,
-                'size': object_size,
-                'last_modified': last_modified,
-                'batch_info': batch_info,
-                'batch_update': update_result,
-                'event_source': 's3_native',
-                'race_protection_used': update_result.get('retry_attempts', 0) > 0
-            }
-        }
-        
-    except ClientError as e:
-        error_msg = f"S3 error: {e.response['Error']['Message']}"
-        logger.error(error_msg)
-        return {
-            'success': False,
-            'error': error_msg
-        }
-    except Exception as e:
-        error_msg = f"S3 processing error: {str(e)}"
-        logger.error(error_msg)
-        return {
-            'success': False,
-            'error': error_msg
-        }
+    if file_type not in FILE_TYPE_TO_ATTR:
+        logger.debug(f"Unknown file_type {file_type!r} in key {object_key!r}")
+        return None
 
-def update_batch_json_with_race_protection(s3_client, bucket_name: str, batch_info: Dict[str, Any]) -> Dict[str, Any]:
-    batch_folder = batch_info['batch_folder']
-    patient_id = batch_info['patient_id']
-    file_type = batch_info['file_type']
-    filename = batch_info['filename']
-    event_fingerprint = batch_info['event_fingerprint']
-    batch_json_key = f"{batch_folder}/batch.json"
-
-    logger.info(f"Updating batch.json with race protection: {batch_json_key}")
-
-    expected_file_counts = get_expected_file_counts()
-
-    for attempt in range(MAX_RETRY_ATTEMPTS):
-        try:
-            # Step 1: Get current batch.json or create new structure
-            current_etag = None
-            was_already_complete = False
-
-            try:
-                response = s3_client.get_object(Bucket=bucket_name, Key=batch_json_key)
-                batch_data = json.loads(response['Body'].read().decode('utf-8'))
-                current_etag = response['ETag'].strip('"')
-                was_already_complete = batch_data.get('status') == 'complete'
-                logger.info(f"Attempt {attempt + 1}: Found existing batch.json with ETag: {current_etag}")
-            except ClientError as e:
-                if e.response['Error']['Code'] == 'NoSuchKey':
-                    # ✅ Flat structure — no nested 'patients' dict
-                    batch_data = {
-                        'batch_id': batch_folder,
-                        'patient_id': patient_id,
-                        'created_at': datetime.utcnow().isoformat(),
-                        'file_counts': {ft: 0 for ft in expected_file_counts.keys()},
-                        'processed_files': [],
-                        'processed_events': [],
-                        'total_files': 0,
-                        'expected_files': sum(expected_file_counts.values()),
-                        'status': 'processing',
-                        'is_complete': False,
-                        'last_updated': datetime.utcnow().isoformat(),
-                        'version': 1
-                    }
-                    current_etag = None
-                    was_already_complete = False
-                    logger.info(f"Attempt {attempt + 1}: Creating new batch.json structure")
-                else:
-                    raise e
-
-            # Step 2: Check event-level deduplication
-            processed_events = batch_data.get('processed_events', [])
-            if event_fingerprint in processed_events:
-                logger.info(f"Event {event_fingerprint} already processed - returning early")
-                return {
-                    'already_processed': True,
-                    'event_fingerprint': event_fingerprint,
-                    'batch_json_key': batch_json_key,
-                    'retry_attempts': attempt
-                }
-
-            # Step 3: Check file-level deduplication
-            file_id = f"{file_type}/{filename}"
-            if file_id in batch_data.get('processed_files', []):
-                logger.info(f"File {file_id} already processed for patient {patient_id}")
-                return {
-                    'already_processed': True,
-                    'file_already_counted': True,
-                    'file_id': file_id,
-                    'batch_json_key': batch_json_key,
-                    'retry_attempts': attempt
-                }
-
-            # Step 4: Apply the update — flat structure, no patients dict
-            processed_events.append(event_fingerprint)
-            batch_data['processed_files'].append(file_id)
-            batch_data['last_file_received'] = datetime.utcnow().isoformat()
-
-            if file_type in batch_data['file_counts']:
-                old_count = batch_data['file_counts'][file_type]
-                batch_data['file_counts'][file_type] += 1
-                batch_data['total_files'] += 1
-                logger.info(f"Updated file count for {file_type}: {old_count} -> {batch_data['file_counts'][file_type]}")
-
-            # Step 5: Calculate completion
-            total_files = batch_data['total_files']
-            expected_files = batch_data['expected_files']
-            completion_percentage = (total_files / expected_files) * 100 if expected_files > 0 else 0
-
-            meets_threshold = completion_percentage >= COMPLETION_THRESHOLD_PERCENTAGE
-            traditional_complete = all(
-                batch_data['file_counts'][ft] >= expected_count
-                for ft, expected_count in expected_file_counts.items()
-            )
-
-            is_complete = meets_threshold or traditional_complete
-            batch_data['is_complete'] = is_complete
-            batch_data['completion_percentage'] = round(completion_percentage, 2)
-            batch_data['completion_method'] = (
-                'traditional' if traditional_complete
-                else 'threshold' if meets_threshold
-                else 'incomplete'
-            )
-
-            batch_newly_completed = False
-            if is_complete and not was_already_complete:
-                batch_data['status'] = 'complete'
-                batch_data['completed_at'] = datetime.utcnow().isoformat()
-                batch_data['completion_strategy'] = 'threshold_based'
-                batch_data['completion_threshold'] = COMPLETION_THRESHOLD_PERCENTAGE
-                batch_newly_completed = True
-                logger.info(f"BATCH {batch_folder} has just become COMPLETE!")
-
-            # Step 6: Update metadata
-            batch_data['processed_events'] = processed_events
-            batch_data['last_updated'] = datetime.utcnow().isoformat()
-            batch_data['version'] = batch_data.get('version', 1) + 1
-            batch_data['stats'] = {
-                'total_files_processed': total_files,
-                'total_expected_files': expected_files,
-                'completion_percentage': round(completion_percentage, 2),
-                'completion_threshold': COMPLETION_THRESHOLD_PERCENTAGE,
-                'completion_strategy': 'threshold_based'
-            }
-
-            if len(processed_events) > 1000:
-                batch_data['processed_events'] = processed_events[-1000:]
-
-            # Step 7: Conditional write
-            put_object_args = {
-                'Bucket': bucket_name,
-                'Key': batch_json_key,
-                'Body': json.dumps(batch_data, indent=2),
-                'ContentType': 'application/json'
-            }
-
-            if current_etag:
-                put_object_args['IfMatch'] = current_etag
-                logger.info(f"Attempt {attempt + 1}: Conditional write with ETag: {current_etag}")
-            else:
-                put_object_args['IfNoneMatch'] = '*'
-                logger.info(f"Attempt {attempt + 1}: Creating new file with IfNoneMatch=*")
-
-            s3_client.put_object(**put_object_args)
-            logger.info(f"Attempt {attempt + 1}: Successfully updated batch.json for {batch_folder}")
-
-            return {
-                'already_processed': False,
-                'batch_json_updated': True,
-                'patient_complete': is_complete,
-                'batch_complete': batch_data['status'] == 'complete',
-                'batch_newly_completed': batch_newly_completed,
-                'patient_file_counts': {patient_id: batch_data['file_counts']},
-                'batch_json_key': batch_json_key,
-                'event_fingerprint': event_fingerprint,
-                'retry_attempts': attempt,
-                'version': batch_data['version'],
-                'debug_info': {
-                    'completion_percentage': round(completion_percentage, 2),
-                    'completion_threshold': COMPLETION_THRESHOLD_PERCENTAGE,
-                    'meets_threshold': meets_threshold,
-                    'traditional_complete': traditional_complete
-                }
-            }
-
-        except ClientError as e:
-            if e.response['Error']['Code'] in ['PreconditionFailed', 'ConditionalRequestConflict']:
-                retry_delay = min(BASE_RETRY_DELAY * (2 ** attempt) + random.uniform(0, 0.1), MAX_RETRY_DELAY)
-                logger.warning(f"Attempt {attempt + 1}: Race condition detected, retrying in {retry_delay:.3f}s")
-                if attempt < MAX_RETRY_ATTEMPTS - 1:
-                    time.sleep(retry_delay)
-                    continue
-                else:
-                    logger.error(f"Race condition: Max retry attempts ({MAX_RETRY_ATTEMPTS}) exceeded")
-                    return {
-                        'batch_json_updated': False,
-                        'error': f"Race condition: Max retry attempts exceeded after {MAX_RETRY_ATTEMPTS} tries",
-                        'retry_attempts': attempt + 1,
-                        'error_type': 'race_condition_max_retries'
-                    }
-            else:
-                logger.error(f"Attempt {attempt + 1}: S3 error: {e.response['Error']['Code']} - {e.response['Error']['Message']}")
-                return {
-                    'batch_json_updated': False,
-                    'error': f"S3 error: {e.response['Error']['Message']}",
-                    'retry_attempts': attempt,
-                    'error_type': 's3_error'
-                }
-
-        except Exception as e:
-            logger.error(f"Attempt {attempt + 1}: Unexpected error: {str(e)}")
-            return {
-                'batch_json_updated': False,
-                'error': str(e),
-                'retry_attempts': attempt,
-                'error_type': 'unexpected_error'
-            }
+    # Use today's UTC date so the primary key is unique per patient per day
+    batch_date = datetime.now(timezone.utc).strftime('%Y-%m-%d')
 
     return {
-        'batch_json_updated': False,
-        'error': 'Unknown error in race protection loop',
-        'retry_attempts': MAX_RETRY_ATTEMPTS,
-        'error_type': 'unknown_error'
+        'patient_id': patient_id,
+        'file_type':  file_type,
+        'filename':   filename,
+        'batch_date': batch_date,
     }
-def parse_object_key(object_key: str) -> Dict[str, Any]:
-    """
-    Parse S3 object key to extract batch and patient information
-    New format: Testing-1_cd037752/garmin-device-heart-rate/250204_garmin-device-heart-rate_Testing-1_cd037752.csv
-    """
-    try:
-        logger.info(f"Parsing object key: {object_key}")
-        
-        path_parts = object_key.split('/')
-        
-        if len(path_parts) < 3:  # ✅ updated from 4 to 3
-            logger.warning(f"Not enough path parts: {len(path_parts)}, expected at least 3")
-            return None
-        
-        patient_id = path_parts[0]   # 'Testing-1_cd037752'
-        file_type = path_parts[1]    # 'garmin-device-respiration'
-        filename = path_parts[2]     # '260119_garmin-device-respiration_Testing-1_cd037752.csv'
-        
-        # ✅ Use patient_id as the batch folder since there's no separate batch segment
-        batch_folder = patient_id
-        
-        expected_file_counts = get_expected_file_counts()
-        if file_type not in expected_file_counts:
-            logger.warning(f"Unknown file type: {file_type}")
-            return None
-        
-        if not all([batch_folder, patient_id, file_type]):
-            logger.warning(f"Missing required fields")
-            return None
-        
-        return {
-            'batch_folder': batch_folder,
-            'patient_id': patient_id,
-            'file_type': file_type,
-            'filename': filename
-        }
-    
-    except Exception as e:
-        logger.error(f"Error parsing object key {object_key}: {str(e)}")
-        return None
-
-def process_regular_s3_event(bucket_name: str, object_key: str, s3_client) -> Dict[str, Any]:
-    """
-    Process regular S3 events that don't match the batch pattern
-    """
-    try:
-        response = s3_client.head_object(Bucket=bucket_name, Key=object_key)
-        
-        return {
-            'success': True,
-            'data': {
-                'bucket': bucket_name,
-                'key': object_key,
-                'size': response.get('ContentLength'),
-                'last_modified': response.get('LastModified').isoformat() if response.get('LastModified') else None,
-                'type': 'regular_s3_event'
-            }
-        }
-        
-    except Exception as e:
-        return {
-            'success': False,
-            'error': f"Regular S3 processing error: {str(e)}"
-        }
-
-def trigger_batch_complete_events(eventbridge_client, bucket_name: str, batch_info: Dict[str, Any], update_result: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Trigger EventBridge rules when a batch becomes complete
-    """
-    try:
-        # Get EventBridge configuration from environment variables
-        eventbridge_config = get_eventbridge_config()
-        completion_rule_name = eventbridge_config['completion_rule_name']
-        processing_rule_name = eventbridge_config['processing_rule_name']
-        garmin_detail_type = eventbridge_config['garmin_detail_type']
-        bbi_detail_type = eventbridge_config['bbi_detail_type']
-        eventbus_name = eventbridge_config['bus_name']
-        
-        batch_folder = batch_info['batch_folder']
-        completion_timestamp = datetime.utcnow().isoformat()
-        
-        # Build base event structure - only include EventBusName if not default
-        base_event_structure = {}
-        if eventbus_name and eventbus_name != 'default':
-            base_event_structure['EventBusName'] = eventbus_name
-        
-        # Event 1: Batch Processing Complete - matches completion rule pattern
-        # EventBridge rule expects: source=["lambda"], detail-type=[environment-specific detail type]
-        event_1 = {
-            'Source': 'lambda',
-            'DetailType': garmin_detail_type,
-            'Detail': json.dumps({
-                'batchId': batch_folder,
-                'bucketName': bucket_name,
-                'completedAt': completion_timestamp,
-                'totalPatients': len(update_result.get('patient_file_counts', {})),
-                'status': 'complete',
-                'eventType': 'batch_completion',
-                'metadata': {
-                    'batchFolder': batch_folder,
-                    'triggerFile': f"{batch_info['patient_id']}/{batch_info['file_type']}/{batch_info['filename']}",
-                    'eventFingerprint': batch_info.get('event_fingerprint'),
-                    'completionReason': 'all_required_files_received',
-                    'targetRule': completion_rule_name
-                }
-            }),
-            **base_event_structure
-        }
-        
-        # Event 2: Batch Ready for Processing - matches processing rule pattern
-        # EventBridge rule expects: source=["lambda"], detail-type=[environment-specific detail type]
-        event_2 = {
-            'Source': 'lambda',
-            'DetailType': bbi_detail_type,
-            'Detail': json.dumps({
-                'batchId': batch_folder,
-                'bucketName': bucket_name,
-                'readyAt': completion_timestamp,
-                'dataLocation': f"s3://{bucket_name}/{batch_folder}/",
-                'processingStatus': 'ready',
-                'patientCount': len(update_result.get('patient_file_counts', {})),
-                'fileStatistics': {
-                    'totalFiles': sum(
-                        sum(patient_counts.values()) 
-                        for patient_counts in update_result.get('patient_file_counts', {}).values()
-                    ),
-                    'expectedFiles': sum(get_expected_file_counts().values()) * len(update_result.get('patient_file_counts', {})),
-                    'fileTypeBreakdown': get_expected_file_counts(),
-                    'patientFileBreakdown': update_result.get('patient_file_counts', {})
-                },
-                'metadata': {
-                    'batchFolder': batch_folder,
-                    'batchJsonLocation': f"s3://{bucket_name}/{batch_folder}/batch.json",
-                    'lastFileProcessed': f"{batch_info['patient_id']}/{batch_info['file_type']}/{batch_info['filename']}",
-                    'processingTrigger': 'file_completion_threshold_met',
-                    'targetRule': processing_rule_name
-                }
-            }),
-            **base_event_structure
-        }
-        
-        survey_rule_name = eventbridge_config['survey_rule_name']
-        survey_detail_type = eventbridge_config['survey_detail_type']
-
-        event_3 = {
-            'Source': 'lambda',
-            'DetailType': survey_detail_type,
-            'Detail': json.dumps({
-                'batchId': batch_folder,
-                'bucketName': bucket_name,
-                'completedAt': completion_timestamp,
-                'status': 'complete',
-                'metadata': {
-                    'batchFolder': batch_folder,
-                    'lastFileProcessed': f"{batch_info['patient_id']}/{batch_info['file_type']}/{batch_info['filename']}",
-                    'targetRule': survey_rule_name
-                }
-            }),
-            **base_event_structure
-        }
-
-        events_to_send = [event_1, event_2, event_3]
-        
-        # Log the exact event structure being sent for debugging
-        logger.info(f"DEBUG: Sending EventBridge events for batch {batch_folder}")
-        logger.info(f"DEBUG: Event 1 structure - Source: {event_1.get('Source')}, DetailType: {event_1.get('DetailType')}, EventBusName: {event_1.get('EventBusName', 'default (omitted)')}")
-        logger.info(f"DEBUG: Event 2 structure - Source: {event_2.get('Source')}, DetailType: {event_2.get('DetailType')}, EventBusName: {event_2.get('EventBusName', 'default (omitted)')}")
-        logger.info(f"DEBUG: Event 3 structure - Source: {event_3.get('Source')}, DetailType: {event_3.get('DetailType')}, EventBusName: {event_3.get('EventBusName', 'default (omitted)')}")
-        logger.info(f"DEBUG: Expected rule patterns - Rule 1: source=['lambda'], detail-type=['{garmin_detail_type}']")
-        logger.info(f"DEBUG: Expected rule patterns - Rule 2: source=['lambda'], detail-type=['{bbi_detail_type}']")
-        logger.info(f"DEBUG: Expected rule patterns - Rule 3: source=['lambda'], detail-type=['{survey_detail_type}']")
-        
-        response = eventbridge_client.put_events(Entries=events_to_send)
-        
-        # Check for any failed events
-        failed_events = response.get('FailedEntryCount', 0)
-        
-        # Log full response for debugging
-        logger.info(f"DEBUG: EventBridge put_events response: {json.dumps(response, default=str)}")
-        
-        if failed_events > 0:
-            logger.error(f"Failed to send {failed_events} events to EventBridge")
-            logger.error(f"Failed entries: {response.get('Entries', [])}")
-        else:
-            logger.info(f"Successfully sent 3 different events to EventBridge for batch {batch_folder}")
-            logger.info(f"Event 1: Targeting rule '{completion_rule_name}' with source='lambda', detail-type='{garmin_detail_type}'")
-            logger.info(f"Event 2: Targeting rule '{processing_rule_name}' with source='lambda', detail-type='{bbi_detail_type}'")
-            logger.info(f"Event 3: Targeting rule '{survey_rule_name}' with source='lambda', detail-type='{survey_detail_type}'")
-            logger.info(f"DEBUG: Check EventBridge console to verify rules are ENABLED and matching these events")
-        
-        return {
-            'events_sent': len(events_to_send),
-            'failed_events': failed_events,
-            'eventbridge_response': response,
-            'targeted_rules': [
-                completion_rule_name,
-                processing_rule_name
-            ],
-            'event_details': [
-                {
-                    'event_number': 1,
-                    'source': 'lambda',
-                    'detail_type': garmin_detail_type,
-                    'batch_id': batch_folder,
-                    'purpose': 'Completion notification',
-                    'target_rule': completion_rule_name
-                },
-                {
-                    'event_number': 2,
-                    'source': 'lambda', 
-                    'detail_type': bbi_detail_type,
-                    'batch_id': batch_folder,
-                    'purpose': 'Processing trigger',
-                    'target_rule': processing_rule_name
-                },
-                {
-                    'event_number': 3,
-                    'source': 'lambda',
-                    'detail_type': survey_detail_type,
-                    'batch_id': batch_folder,
-                    'purpose': 'Survey data merged files trigger',
-                    'target_rule': survey_rule_name
-                }
-            ]
-        }
-        
-    except Exception as e:
-        logger.error(f"Error triggering EventBridge events: {str(e)}")
-        return {
-            'error': str(e),
-            'events_sent': 0,
-            'failed_events': len(events_to_send) if 'events_to_send' in locals() else 2
-        }
-
-def handle_failed_messages(failed_messages: List[Dict[str, Any]]) -> None:
-    """
-    Handle failed messages with enhanced logging for race condition analysis
-    """
-    try:
-        logger.error(f"Failed to process {len(failed_messages)} messages")
-        
-        race_condition_failures = 0
-        s3_failures = 0
-        other_failures = 0
-        
-        for failed_msg in failed_messages:
-            logger.error(f"Failed message: {failed_msg}")
-            
-            # Categorize failure types for monitoring
-            error_type = failed_msg.get('error_type', 'unknown')
-            if error_type == 'race_condition_max_retries':
-                race_condition_failures += 1
-            elif error_type == 's3_error':
-                s3_failures += 1
-            else:
-                other_failures += 1
-        
-        # Log failure summary for monitoring/alerting
-        if race_condition_failures > 0:
-            logger.error(f"ALERT: {race_condition_failures} messages failed due to persistent race conditions!")
-        if s3_failures > 0:
-            logger.error(f"ALERT: {s3_failures} messages failed due to S3 errors!")
-        if other_failures > 0:
-            logger.error(f"ALERT: {other_failures} messages failed due to other errors!")
-            
-    except Exception as e:
-        logger.error(f"Error handling failed messages: {str(e)}")

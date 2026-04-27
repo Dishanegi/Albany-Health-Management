@@ -146,3 +146,21 @@ class SQSQueues(Construct):
             queue_name=f"AlbanyHealthSurveyDataProcessingFile-SQSQueue-{env_suffix}",
             visibility_timeout=visibility_timeout
         )
+
+        survey_processing_files_dlq = sqs.Queue(
+            self,
+            f"AlbanyHealthSurveyProcessingFiles-DLQ-{env_suffix}",
+            queue_name=f"AlbanyHealthSurveyProcessingFiles-DLQ-{env_suffix}",
+            retention_period=Duration.days(14),
+        )
+
+        self.survey_processing_files_queue = sqs.Queue(
+            self,
+            f"AlbanyHealthSurveyProcessingFiles-SQSQueue-{env_suffix}",
+            queue_name=f"AlbanyHealthSurveyProcessingFiles-SQSQueue-{env_suffix}",
+            visibility_timeout=visibility_timeout,
+            dead_letter_queue=sqs.DeadLetterQueue(
+                max_receive_count=max_receive_count,
+                queue=survey_processing_files_dlq,
+            ),
+        )

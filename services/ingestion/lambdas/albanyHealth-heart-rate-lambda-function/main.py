@@ -61,6 +61,7 @@ def lambda_handler(event, context):
     failed_files = []
 
     for record in event['Records']:
+        object_key = None
         try:
             # Parse message body
             message = json.loads(record['body'])
@@ -80,8 +81,10 @@ def lambda_handler(event, context):
 
             # Parse CSV
             df = pd.read_csv(StringIO(file_content), skiprows=6, encoding='utf-8')
+            if df.empty:
+                raise ValueError(f"File contains no data rows after skipping header: {object_key}")
             print(f"Original columns: {df.columns.tolist()}")
-            
+
             # Process data
             processed_df = process_heart_rate_data(df, participant_id)
             print(f"Processed columns: {processed_df.columns.tolist()}")
@@ -103,8 +106,16 @@ def lambda_handler(event, context):
 
         except Exception as e:
             print(f"Error processing file: {str(e)}")
+            # Write zero-byte placeholder so the inactivity checker can still count this file
+            # and the batch does not stall waiting for a file that will never produce output.
+            if object_key and destination_bucket:
+                try:
+                    s3.put_object(Bucket=destination_bucket, Key=object_key, Body=b"", ContentType='text/csv')
+                    print(f"Wrote empty placeholder for failed file: {object_key}")
+                except Exception as placeholder_err:
+                    print(f"Could not write placeholder for {object_key}: {placeholder_err}")
             failed_files.append({
-                'file': object_key if 'object_key' in locals() else 'unknown',
+                'file': object_key or 'unknown',
                 'error': str(e)
             })
 
