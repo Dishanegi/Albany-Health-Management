@@ -37,15 +37,19 @@ def log_info(message):
 
 def list_csv_files_in_folder(s3_client, bucket, prefix):
     """
-    Return every .csv key under bucket/prefix using pagination.
-    Works correctly whether the folder contains 1 file or many.
+    Return every non-empty .csv key under bucket/prefix using pagination.
+    Zero-byte files (placeholders written when a source file was empty/invalid)
+    are skipped so Spark never tries to read them.
     """
     keys = []
     paginator = s3_client.get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
             if obj["Key"].endswith(".csv"):
-                keys.append(obj["Key"])
+                if obj.get("Size", 0) > 0:
+                    keys.append(obj["Key"])
+                else:
+                    log_info(f"  Skipping zero-byte placeholder: {obj['Key']}")
     return keys
 
 

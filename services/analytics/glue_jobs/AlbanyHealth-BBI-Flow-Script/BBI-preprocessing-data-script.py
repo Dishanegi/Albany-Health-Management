@@ -150,8 +150,10 @@ try:
             if "Contents" in page:
                 for obj in page["Contents"]:
                     key = obj["Key"]
-                    if "bbi" in key.lower() and key.endswith((".csv", ".csv.gz")):
+                    if "bbi" in key.lower() and key.endswith((".csv", ".csv.gz")) and obj.get("Size", 0) > 0:
                         bbi_files.append(key)
+                    elif "bbi" in key.lower() and key.endswith((".csv", ".csv.gz")):
+                        log_info(f"  Skipping zero-byte placeholder: {key}")
     else:
         # Now get all CSV files from these folders and subfolders
         for folder in bbi_folders:
@@ -160,8 +162,10 @@ try:
                 if "Contents" in page:
                     for obj in page["Contents"]:
                         key = obj["Key"]
-                        if key.endswith((".csv", ".csv.gz")):
+                        if key.endswith((".csv", ".csv.gz")) and obj.get("Size", 0) > 0:
                             bbi_files.append(key)
+                        elif key.endswith((".csv", ".csv.gz")):
+                            log_info(f"  Skipping zero-byte placeholder: {key}")
     
     log_info(f"Found {len(bbi_files)} BBI files")
     
