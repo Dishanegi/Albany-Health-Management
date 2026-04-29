@@ -56,6 +56,20 @@ class LambdaFunctions(Construct):
         project_root = current_file.parent.parent.parent.parent
         services_base_path = str(project_root / "services" / "ingestion" / "lambdas")
 
+        # ── Shared utilities Lambda Layer ─────────────────────────────────────────
+        # Contains utils.py (extract_participant_id, format_iso_timestamp,
+        # write_placeholder).  The directory must have a python/ subdirectory so
+        # Lambda's Python runtime adds /opt/python to sys.path automatically.
+        shared_layer_path = str(project_root / "services" / "ingestion" / "lambdas" / "shared")
+        self.shared_utils_layer = lambda_.LayerVersion(
+            self,
+            f"SharedUtilsLayer-{env_suffix.capitalize()}",
+            code=lambda_.Code.from_asset(shared_layer_path),
+            compatible_runtimes=[lambda_.Runtime.PYTHON_3_13],
+            description="Shared utilities: participant ID extraction, timestamp formatting, placeholder writes",
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+
         main_router_log_group = logs.LogGroup(
             self,
             f"MainRouterLogGroup-{env_suffix.capitalize()}",
@@ -99,11 +113,14 @@ class LambdaFunctions(Construct):
             timeout=Duration.seconds(300),
             memory_size=1024,
             log_group=heart_rate_log_group,
-            layers=[lambda_.LayerVersion.from_layer_version_arn(
-                self,
-                f"HeartRatePandasLayer-{env_suffix.capitalize()}",
-                pandas_layer_arn
-            )],
+            layers=[
+                self.shared_utils_layer,
+                lambda_.LayerVersion.from_layer_version_arn(
+                    self,
+                    f"HeartRatePandasLayer-{env_suffix.capitalize()}",
+                    pandas_layer_arn
+                ),
+            ],
             environment={
                 "DESTINATION_BUCKET": processed_bucket.bucket_name,
             }
@@ -126,11 +143,14 @@ class LambdaFunctions(Construct):
             timeout=Duration.seconds(300),
             memory_size=1024,
             log_group=step_log_group,
-            layers=[lambda_.LayerVersion.from_layer_version_arn(
-                self,
-                f"StepsPandasLayer-{env_suffix.capitalize()}",
-                pandas_layer_arn
-            )],
+            layers=[
+                self.shared_utils_layer,
+                lambda_.LayerVersion.from_layer_version_arn(
+                    self,
+                    f"StepsPandasLayer-{env_suffix.capitalize()}",
+                    pandas_layer_arn
+                ),
+            ],
             environment={
                 "DESTINATION_BUCKET": processed_bucket.bucket_name,
             }
@@ -153,11 +173,14 @@ class LambdaFunctions(Construct):
             timeout=Duration.seconds(300),
             memory_size=1024,
             log_group=sleep_log_group,
-            layers=[lambda_.LayerVersion.from_layer_version_arn(
-                self,
-                f"SleepPandasLayer-{env_suffix.capitalize()}",
-                pandas_layer_arn
-            )],
+            layers=[
+                self.shared_utils_layer,
+                lambda_.LayerVersion.from_layer_version_arn(
+                    self,
+                    f"SleepPandasLayer-{env_suffix.capitalize()}",
+                    pandas_layer_arn
+                ),
+            ],
             environment={
                 "DESTINATION_BUCKET": processed_bucket.bucket_name,
             }
@@ -180,11 +203,14 @@ class LambdaFunctions(Construct):
             timeout=Duration.seconds(300),
             memory_size=1024,
             log_group=other_metrics_log_group,
-            layers=[lambda_.LayerVersion.from_layer_version_arn(
-                self,
-                f"OtherMetricsPandasLayer-{env_suffix.capitalize()}",
-                pandas_layer_arn
-            )],
+            layers=[
+                self.shared_utils_layer,
+                lambda_.LayerVersion.from_layer_version_arn(
+                    self,
+                    f"OtherMetricsPandasLayer-{env_suffix.capitalize()}",
+                    pandas_layer_arn
+                ),
+            ],
             environment={
                 "DESTINATION_BUCKET": processed_bucket.bucket_name,
             }
@@ -246,11 +272,14 @@ class LambdaFunctions(Construct):
             timeout=Duration.seconds(300),
             memory_size=1024,
             log_group=survey_normalise_log_group,
-            layers=[lambda_.LayerVersion.from_layer_version_arn(
-                self,
-                f"SurveyDataPandasLayer-{env_suffix.capitalize()}",
-                pandas_layer_arn
-            )],
+            layers=[
+                self.shared_utils_layer,
+                lambda_.LayerVersion.from_layer_version_arn(
+                    self,
+                    f"SurveyDataPandasLayer-{env_suffix.capitalize()}",
+                    pandas_layer_arn
+                ),
+            ],
             environment={
                 "DESTINATION_BUCKET": survey_data_processing_bucket.bucket_name,
             }

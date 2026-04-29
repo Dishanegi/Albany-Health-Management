@@ -4,24 +4,9 @@ import boto3
 import pandas as pd
 import numpy as np
 from io import StringIO
-import re
 from datetime import datetime, timedelta
 
-def extract_participantId(object_key):
-    """
-    Extracts the participant ID from the object key
-    """
-    match = re.search(r'_([a-zA-Z0-9]{8})\.csv$', object_key)
-    return match.group(1) if match else None
-
-def format_iso_date_to_timestamp(iso_date_str):
-    """
-    Formats ISO date string to yyyy-mm-dd hh:mm format (with seconds set to zero)
-    """
-    # Parse the ISO date string
-    dt = datetime.fromisoformat(iso_date_str.replace('Z', '+00:00'))
-    # Format with just minutes, no seconds
-    return dt.strftime('%Y-%m-%d %H:%M')
+from utils import extract_participant_id, format_iso_timestamp, write_placeholder
 
 def convert_ms_to_minutes(duration_ms):
     """
@@ -206,7 +191,7 @@ def process_sleep_data(df, participant_id):
         df.insert(
             df.columns.get_loc('isoDate') + 1,
             'Timestamp',
-            df['isoDate'].apply(format_iso_date_to_timestamp)
+            df['isoDate'].apply(format_iso_timestamp)
         )
         
         # Add the new column: participantid_timestamp
@@ -250,7 +235,7 @@ def lambda_handler(event, context):
             print(f"Processing file: s3://{source_bucket}/{object_key}")
 
             # Extract participant ID
-            participant_id = extract_participantId(object_key)
+            participant_id = extract_participant_id(object_key)
             if not participant_id:
                 raise ValueError(f"Could not extract participant ID from {object_key}")
 
@@ -287,14 +272,8 @@ def lambda_handler(event, context):
 
         except Exception as e:
             print(f"Error processing file: {str(e)}")
-            # Write zero-byte placeholder so the inactivity checker can still count this file
-            # and the batch does not stall waiting for a file that will never produce output.
             if object_key and destination_bucket:
-                try:
-                    s3.put_object(Bucket=destination_bucket, Key=object_key, Body=b"", ContentType='text/csv')
-                    print(f"Wrote empty placeholder for failed file: {object_key}")
-                except Exception as placeholder_err:
-                    print(f"Could not write placeholder for {object_key}: {placeholder_err}")
+                write_placeholder(s3, destination_bucket, object_key)
             failed_files.append({
                 'file': object_key or 'unknown',
                 'error': str(e)

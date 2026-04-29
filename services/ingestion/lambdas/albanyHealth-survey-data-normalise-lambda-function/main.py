@@ -8,6 +8,8 @@ from datetime import datetime
 import boto3
 import pandas as pd
 
+from utils import write_placeholder
+
 # ---------- AWS clients ----------
 s3 = boto3.client("s3")
 
@@ -199,12 +201,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             "Skipping unparseable/empty file s3://%s/%s — writing placeholder so batch count is not affected. Reason: %s",
             bucket, key, e,
         )
-        s3.put_object(
-            Bucket=out_bucket,
-            Key=out_key,
-            Body=b"",
-            ContentType="text/csv",
-        )
+        write_placeholder(s3, out_bucket, out_key)
         return {
             "statusCode": 200,
             "input": {"bucket": bucket, "key": key},
